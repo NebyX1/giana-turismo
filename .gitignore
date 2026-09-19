@@ -1,0 +1,71 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python environments and caches
+.venv/
+venv/
+env/
+virtualenv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# Node/build output
+node_modules/
+dist/
+build/
+out/
+.next/
+coverage/
+*.tsbuildinfo
+
+# Logs and runtime diagnostics
+logs/
+*.log
+*.jsonl
+run/*.pid
+run/*counters*.json
+reports/
+voice_trace*
+
+# Runtime databases and generated indexes
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+qdrant_storage/
+qdrant_data/
+vector_store/
+vectorstore/
+embeddings_cache/
+embedding_cache/
+data/*
+!data/.gitkeep
+storage/*
+!storage/.gitkeep
+
+# Model weights and downloaded voices; source code named models is allowed
+*.onnx
+*.onnx.data
+*.gguf
+*.ggml
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.bin
+voice/piper/*.onnx.json
+models/cache/
+model_cache/
+huggingface/
+ollama/models/
+
+# IDE files
+.idea/
+.vscode/

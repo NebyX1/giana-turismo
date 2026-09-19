@@ -1,0 +1,7 @@
+torch
+sentence-transformers
+qdrant-client
+Flask
+requests
+python-dotenv
+
