@@ -1,5 +1,13 @@
 # Progreso Giana V2
 
+> **Estado de arquitectura actual:** el snapshot publicado usa Whisper
+> large-v3-turbo con faster-whisper/CTranslate2 en CUDA como STT predeterminado;
+> Moonshine queda como rollback. La voz conserva Silero + SmartTurn + Pipecat,
+> la barrera `TurnState` y Piper HTTP como TTS operativo. Kokoro CUDA existe como
+> adaptador preparado, pero no está conectado por los builders actuales. Ver
+> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) para el flujo vigente; las
+> secciones M0-M5 siguientes conservan el historial de aceptación.
+
 ## M0 — Bootstrap y smoke de hardware
 
 - Estado: PASS
@@ -30,10 +38,10 @@
 - Consentimiento de web ligado a sesión/request, TTL y rechazo por expiración.
 - Ollama Web Search/Web Fetch integrados; resultados marcados como web/efímeros.
 
-## M3 — Voz local SmallWebRTC
+## M3 — Voz local SmallWebRTC (histórico, actualizado)
 
 - Estado: PASS de runner y componentes.
-- Pipecat + Silero + Moonshine ES CPU + Piper `es_AR-daniela-high` HTTP CPU.
+- Pipecat + Silero + Whisper large-v3-turbo CUDA por defecto (Moonshine ES CPU como rollback) + Piper `es_AR-daniela-high` HTTP CPU.
 - Runner SmallWebRTC levantado y UI prebuilt verificada.
 
 ## M4 — Interrupciones + frontend

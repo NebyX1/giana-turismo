@@ -2,27 +2,37 @@
 
 Asistente turístico de Lavalleja con frontend React/Vite, voz en tiempo real y RAG híbrido local. Este snapshot contiene el core reproducible; no incluye corpus, índices, bases runtime, pesos ni secretos.
 
-## Arquitectura
+## Arquitectura actual
+
+La aplicación está separada en frontend, transporte/pipeline de voz, backend de
+conocimiento y servicios locales. El frontend React/Vite usa HTTP para texto y
+SmallWebRTC/Pipecat para voz. El runner de voz aplica Silero VAD, STT configurable
+(`whisper_turbo` CUDA por defecto o Moonshine CPU), SmartTurn y una barrera
+`TurnState` antes de enviar el turno completo al backend Flask. El backend combina
+enrutamiento semántico, fast paths locales, SQLite FTS5, Granite + Qdrant, RRF,
+mMARCO y respuestas verificadas. Las consultas actuales pueden activar búsqueda
+web con consentimiento y evidencia efímera. Piper HTTP sigue siendo el TTS
+operativo; existe un adaptador Kokoro CUDA seleccionable, pero no es el builder
+activo por defecto.
 
 ```text
-Browser
-  ↓
-React/Vite frontend :5173
-  ↓ SmallWebRTC / Pipecat :7860
-Moonshine STT → RAG híbrido
-                 ├ SQLite FTS5
-                 ├ Qdrant :6333
-                 ├ Granite embeddings en GPU
-                 └ mMARCO reranker en GPU
-                         ↓
-                 Flask backend :5000
-                         ↓
-                 Ollama Cloud / Gemma o GLM
-                         ↓
-                 Piper es_AR-daniela-high :5001
-                         ↓
-                       Browser
+Browser :5173
+  ├─ texto ──► Vite proxy ──► Flask :5000
+  │                              ├─ router semántico / reloj / persona
+  │                              ├─ SQLite FTS5 + Granite CUDA + Qdrant :6333
+  │                              ├─ mMARCO reranker CUDA
+  │                              ├─ web research + consentimiento
+  │                              └─ Ollama Cloud
+  │
+  └─ voz WebRTC ──► Pipecat :7860
+                    ├─ Silero VAD + Whisper Turbo CUDA / Moonshine CPU
+                    ├─ SmartTurn + TurnState
+                    ├─ HTTP ► Flask :5000
+                    └─ Piper HTTP :5001 ──► audio WebRTC ──► Browser
 ```
+
+El diagrama técnico completo, los contratos y los límites del snapshot están en
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Requisitos
 
@@ -48,8 +58,10 @@ Configurá `OLLAMA_API_KEY` en `.env` sin versionarlo. El bootstrap no descarga 
 |---|---|---|
 | `ibm-granite/granite-embedding-97m-multilingual-r2` | Embeddings | Local, GPU; `EMBEDDING_MODEL` |
 | `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` | Reranking | Local, GPU; `RERANKER_MODEL` |
-| Moonshine ES | STT | Local, CPU; Pipecat lo carga desde `voice/pipeline.py` |
+| Whisper large-v3-turbo | STT predeterminado | Local, CUDA mediante faster-whisper/CTranslate2; `STT_PROVIDER=whisper_turbo` |
+| Moonshine ES | STT de rollback | Local, CPU; `STT_PROVIDER=moonshine` |
 | `es_AR-daniela-high` | TTS | Piper local, CPU; `PIPER_VOICE` y `PIPER_URL` |
+| Kokoro 82M / `ef_dora` | TTS optativo | Adaptador CUDA en `voice/tts/kokoro_service.py`; no cableado por defecto |
 | Gemma/GLM cloud | Respuesta LLM | Ollama Cloud; `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, `OLLAMA_API_KEY` |
 | Qdrant | Índice vectorial | Docker, `QDRANT_URL` |
 

@@ -1,5 +1,14 @@
 # Recuperación de arquitectura y aceptación — 19/09/2026
 
+> **Nota de estado actual (20/09/2026).** Este documento conserva decisiones y
+> resultados históricos de la recuperación del 19/09. La arquitectura operativa
+> vigente está descrita en [ARCHITECTURE.md](ARCHITECTURE.md). Desde entonces,
+> el código incorpora `whisper_turbo` como STT predeterminado mediante
+> faster-whisper/CTranslate2 en CUDA, conserva Moonshine como rollback y añade el
+> adaptador Kokoro CUDA. Los builders actuales de `voice/pipeline.py` siguen
+> usando Piper HTTP para TTS; Kokoro no debe describirse como TTS activo hasta que
+> esos builders lo seleccionen.
+
 La versión aprobada por el gate anterior NO acreditaba una entrega funcional:
 `Hola Giana, ¿estás ahí?` se enviaba a recuperación turística, el formato inválido
 del modelo producía un 503 y voz lo presentaba como fallo de la guía. El conjunto
@@ -62,8 +71,10 @@ prioridad sobre el antiguo `OLLAMA_MODEL` de `.env`. `/ready` publica los modelo
 el modo realmente cargados. El build ID incluye ese JSON. Claves y URL del servicio
 continúan en `.env`. Cambiar configuración requiere reiniciar y volver a probar.
 
-No se reemplazaron los motores STT, VAD, TTS ni WebRTC. El mensaje de error de voz
-deja de culpar a la guía por cualquier fallo del backend.
+En la decisión histórica de este documento no se reemplazaron VAD ni WebRTC y se
+conservó Piper como TTS del pipeline. El estado posterior de STT y el adaptador
+Kokoro se documenta en `docs/ARCHITECTURE.md`. El mensaje de error de voz deja de
+culpar a la guía por cualquier fallo del backend.
 
 La prueba real posterior descubrió un defecto en la barrera del turno: al retomar
 habla después de una pausa, la transcripción de la primera parte seguía marcada
