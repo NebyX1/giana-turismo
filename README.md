@@ -36,36 +36,74 @@ El diagrama técnico completo, los contratos y los límites del snapshot están 
 
 ## Requisitos
 
-- Linux/Ubuntu recomendado.
-- Python 3.12 y CUDA/GPU para el RAG configurado.
-- Node 22 para el frontend; Docker para Qdrant y el contenedor de desarrollo frontend.
+- Windows 11 está soportado y es el entorno probado actualmente. Linux/Ubuntu y
+  WSL2 también son válidos para los scripts Bash.
+- Python 3.11 es la versión verificada en Windows; Node.js 22 y npm para el
+  frontend.
+- CUDA y una GPU NVIDIA son necesarias para el perfil actual: Whisper Turbo,
+  Granite y mMARCO se ejecutan localmente en CUDA.
+- Docker Desktop con el motor Linux/WSL2 ejecuta Qdrant. No hay un contenedor de
+  desarrollo del frontend en `docker-compose.yml`; el frontend se ejecuta con
+  npm/Vite.
 - `OLLAMA_API_KEY` válida para Ollama Cloud.
-- Qdrant accesible en `http://localhost:6333`.
-- Los modelos locales, la voz Piper y el corpus deben obtenerse aparte; no están incluidos.
+- Qdrant debe estar accesible en `http://127.0.0.1:6333` cuando se inicia el
+  backend.
+- En esta instalación están preparados localmente el modelo Whisper Turbo, la
+  voz Piper y el corpus. No se publican en GitHub y una instalación nueva debe
+  obtenerlos o generarlos por separado.
 
 ## Instalación
+
+En Windows 11, desde PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+py -3.11 -m venv .venv
+& .\.venv\Scripts\python.exe -m pip install -r backend\requirements.txt
+& .\.venv\Scripts\python.exe -m pip install -r voice\requirements.txt
+Push-Location frontend
+npm ci
+Pop-Location
+docker compose up -d qdrant
+```
+
+Después de preparar el corpus, los pesos y el índice local, iniciá el stack con:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\start_production.ps1
+```
+
+En Linux o WSL2 se puede usar el bootstrap Bash:
 
 ```bash
 cp .env.example .env
 bash scripts/bootstrap.sh
 ```
 
-Configurá `OLLAMA_API_KEY` en `.env` sin versionarlo. El bootstrap no descarga modelos ni datasets grandes.
+Configurá `OLLAMA_API_KEY` en `.env` sin versionarlo. El bootstrap instala
+dependencias y crea directorios, pero no descarga modelos ni datasets grandes.
 
 ## Componentes externos
 
 | Componente | Finalidad | Ejecución/configuración |
 |---|---|---|
-| `ibm-granite/granite-embedding-97m-multilingual-r2` | Embeddings | Local, GPU; `EMBEDDING_MODEL` |
-| `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` | Reranking | Local, GPU; `RERANKER_MODEL` |
-| Whisper large-v3-turbo | STT predeterminado | Local, CUDA mediante faster-whisper/CTranslate2; `STT_PROVIDER=whisper_turbo` |
+| `ibm-granite/granite-embedding-97m-multilingual-r2` | Embeddings | Local, CUDA; `EMBEDDING_MODEL` |
+| `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` | Reranking | Local, CUDA; `RERANKER_MODEL` |
+| `mobiuslabsgmbh/faster-whisper-large-v3-turbo` (`openai/whisper-large-v3-turbo`) | STT predeterminado | Local, faster-whisper/CTranslate2, CUDA `int8_float16`; `STT_PROVIDER=whisper_turbo` |
 | Moonshine ES | STT de rollback | Local, CPU; `STT_PROVIDER=moonshine` |
-| `es_AR-daniela-high` | TTS | Piper local, CPU; `PIPER_VOICE` y `PIPER_URL` |
-| Kokoro 82M / `ef_dora` | TTS optativo | Adaptador CUDA en `voice/tts/kokoro_service.py`; no cableado por defecto |
-| Gemma/GLM cloud | Respuesta LLM | Ollama Cloud; `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, `OLLAMA_API_KEY` |
-| Qdrant | Índice vectorial | Docker, `QDRANT_URL` |
+| Silero VAD + `LocalSmartTurnAnalyzerV3` | Detección y cierre de turnos | Local, CPU; Pipecat |
+| `es_AR-daniela-high` | TTS activo | Piper local, CPU, HTTP en `:5001`; `TTS_PROVIDER=piper` |
+| `hexgrad/Kokoro-82M` / `ef_dora` | TTS alternativo | Adaptador CUDA probado en `voice/tts/kokoro_service.py`; requiere `TTS_PROVIDER=kokoro` y no es el perfil activo |
+| `deepseek-v4.1-flash:cloud` | Router semántico y respuesta principal | Ollama Cloud; `backend/app/runtime_config.json` |
+| `gemma4:31b-cloud` | Fallback de router/respuesta e investigación web | Ollama Cloud; `backend/app/runtime_config.json` |
+| DDGS + Ollama Web Search | Investigación web | DDGS primario y Ollama Cloud como fallback; `web_search_provider` |
+| Qdrant | Índice vectorial | Docker Desktop/WSL2, `QDRANT_URL` |
 
-Los nombres y pesos de modelos no se incluyen en GitHub. El servidor Piper espera que la voz exista localmente al iniciar `scripts/start_giana_clean.sh`.
+`runtime_config.json` es la fuente efectiva de los modelos cloud; `OLLAMA_MODEL` y
+`OLLAMA_FALLBACK_MODEL` heredados en un `.env` antiguo no sustituyen esa
+configuración. Los pesos locales y la voz ONNX no se incluyen en GitHub. El
+servidor Piper espera que `models/piper/es_AR-daniela-high.onnx` exista al iniciar
+el perfil Piper.
 
 ## RAG
 
@@ -75,7 +113,8 @@ La implementación está en `backend/app/main.py`, `scripts/ingest.py` y `script
 2. Ejecutá `python scripts/ingest.py` para generar SQLite FTS5 y artefactos intermedios.
 3. Ejecutá `python scripts/index_qdrant.py` para crear la colección y cargar vectores.
 
-El corpus original y los modelos deben transferirse por un canal separado y no deben versionarse.
+El corpus original, los pesos y la colección Qdrant deben transferirse o
+generarse por un canal separado y no deben versionarse.
 
 ## Arranque
 

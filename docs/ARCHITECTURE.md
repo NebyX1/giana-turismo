@@ -1,6 +1,6 @@
 # Arquitectura actual
 
-Estado verificado contra el código del repositorio el 20/09/2026. Giana V2 ya no es un flujo lineal de navegador a Flask: separa la interfaz, el transporte de voz, el procesamiento de turnos, el backend de conocimiento y los servicios de infraestructura.
+Estado verificado contra el código y la instalación Windows 11 del repositorio el 20/09/2026. Giana V2 ya no es un flujo lineal de navegador a Flask: separa la interfaz, el transporte de voz, el procesamiento de turnos, el backend de conocimiento y los servicios de infraestructura.
 
 ## Flujo general
 
@@ -68,7 +68,7 @@ WebRTC audio in
 
 La barrera `TurnState` permite que SmartTurn y el transcript final lleguen en cualquier orden. Sólo `try_finalize_turn()` puede despachar el turno; el watchdog y el timeout de gracia son mecanismos de diagnóstico y recuperación, no rutas paralelas de finalización. El `generation_id` permite cancelar una respuesta antigua durante un barge-in sin cancelar la generación nueva del usuario.
 
-El adaptador `voice/tts/kokoro_service.py` implementa Kokoro 82M con CUDA, voz `ef_dora` y conversión de 24 kHz a 16 kHz. Es una integración seleccionable y preparada para pruebas, pero los builders actuales de `voice/pipeline.py` instancian explícitamente Piper; por eso Piper es el TTS operativo del snapshot publicado.
+El adaptador `voice/tts/kokoro_service.py` implementa Kokoro 82M con CUDA, voz `ef_dora` y conversión de 24 kHz a 16 kHz. Fue probado localmente en Windows, pero es una integración seleccionable: el perfil operativo del launcher actual fuerza Piper, por eso Piper es el TTS activo de esta instalación.
 
 ## Backend y enrutamiento
 
@@ -82,6 +82,11 @@ El adaptador `voice/tts/kokoro_service.py` implementa Kokoro 82M con CUDA, voz `
 - información actual o búsqueda explícita: investigación web con consentimiento o fallback permitido.
 
 `backend/app/semantic_router.py` puede seleccionar una herramienta acotada con el modelo configurado en `backend/app/runtime_config.json`: `conversation`, `knowledge`, `web`, `clock`, `persona` u `out_of_scope`. La ejecución no es un bucle de agente abierto: valida la herramienta, limita argumentos y usa un fallback acotado.
+
+La configuración cloud efectiva es `deepseek-v4.1-flash:cloud` como selector
+semántico y modelo primario de respuesta, con `gemma4:31b-cloud` como fallback.
+La búsqueda web usa DDGS como proveedor primario y Ollama Web Search como
+fallback. Los nombres `Gemma/GLM` del texto antiguo no describen el perfil actual.
 
 El endpoint principal es `POST /api/ask-text`. Cada solicitud lleva `session_id`/`conversation_id`, `turn_id`, `generation_id` y `source`. El historial y las generaciones activas son memoria de proceso; no se promete persistencia conversacional después de reiniciar Flask.
 
@@ -121,8 +126,8 @@ Las consultas de agenda, vigencia, horarios o búsqueda explícita se encaminan 
 
 Endpoints principales: `/api/ask-text`, `/api/time`, `/ready`, `/health`, `/api/diagnostics`, `/api/debug/last-turn`, `/api/web/consent`, `/api/web/search`, `/api/web/fetch` y `/api/livekit/token`.
 
-`/ready` del backend sólo devuelve éxito cuando los modelos CUDA están cargados y calentados, Qdrant contiene la colección y la configuración LLM está disponible. El script `scripts/start_production.ps1` levanta y prueba en orden Qdrant, Piper, Flask, Pipecat y frontend; la variante `.sh` mantiene el mismo contrato para Linux.
+`/ready` del backend sólo devuelve éxito cuando los modelos CUDA están cargados y calentados, Qdrant contiene la colección y la configuración LLM está disponible. El script `scripts/start_production.ps1` levanta y prueba en orden Qdrant, Piper, Flask, Pipecat y frontend; la variante `.sh` mantiene el mismo contrato para Linux. En Windows 11, la versión PowerShell es la ruta de arranque verificada.
 
 ## Límites del snapshot
 
-GitHub contiene código, configuración de ejemplo, scripts, tests y documentación. Quedan fuera deliberadamente `.env` reales, claves, corpus, SQLite runtime, colección Qdrant, modelos/pesos, voz ONNX, caches, logs, traces, audios, builds, `node_modules` y virtualenvs. Para ejecutar la aplicación se deben preparar esos artefactos localmente con `scripts/ingest.py`, `scripts/index_qdrant.py` y `scripts/prepare_whisper_turbo.py` cuando corresponda.
+GitHub contiene código, configuración de ejemplo, scripts, tests y documentación. Quedan fuera deliberadamente `.env` reales, claves, corpus, SQLite runtime, colección Qdrant, modelos/pesos, voz ONNX, caches, logs, traces, audios, builds, `node_modules` y virtualenvs. En la instalación Windows actual esos artefactos sí están preparados localmente: `models/whisper-large-v3-turbo`, `models/piper/es_AR-daniela-high.onnx`, `data/source` y `data/generated`. Una instalación nueva debe prepararlos con `scripts/ingest.py`, `scripts/index_qdrant.py` y `scripts/prepare_whisper_turbo.py` cuando corresponda.
