@@ -13,6 +13,11 @@ $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $Root
 $Py = Join-Path $Root '.venv\Scripts\python.exe'
 $Logs = Join-Path $Root 'logs'
+if (Test-Path (Join-Path $Logs 'test\CURRENT_SESSION.txt')) {
+    $Logs = (Get-Content (Join-Path $Logs 'test\CURRENT_SESSION.txt') -Raw).Trim()
+    $manifest = Get-Content (Join-Path $Logs 'manifest.json') -Raw | ConvertFrom-Json
+    $env:QA_SESSION_ID = $manifest.qa_session_id
+}
 New-Item -ItemType Directory -Force -Path $Logs | Out-Null
 $Started = New-Object System.Collections.Generic.List[System.Diagnostics.Process]
 
@@ -47,7 +52,7 @@ function Port-Listening([int]$Port) {
 
 function Start-Service-Process([string]$Name, [string]$File, [string[]]$Arguments, [string]$WorkDir, [hashtable]$Env) {
     foreach ($key in $Env.Keys) { Set-Item -Path "Env:$key" -Value $Env[$key] }
-    $proc = Start-Process -FilePath $File -ArgumentList $Arguments -WorkingDirectory $WorkDir -PassThru `
+    $proc = Start-Process -FilePath $File -ArgumentList $Arguments -WorkingDirectory $WorkDir -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput (Join-Path $Logs "$Name.log") -RedirectStandardError (Join-Path $Logs "$Name.err")
     $Started.Add($proc)
     return $proc
@@ -60,6 +65,13 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { Fail 'Docker no e
 if (-not (Get-Command npm -ErrorAction SilentlyContinue)) { Fail 'npm no está instalado o no está en PATH.' }
 if (-not (Test-Path (Join-Path $Root '.env'))) { Fail 'Falta .env en la raíz (OLLAMA_API_KEY es obligatoria).' }
 if (-not (Select-String -Path (Join-Path $Root '.env') -Pattern '^OLLAMA_API_KEY=.+' -Quiet)) { Fail 'OLLAMA_API_KEY no está definida en .env.' }
+$sttProvider = ((Get-Content (Join-Path $Root '.env') | Where-Object { $_ -match '^STT_PROVIDER=' } | Select-Object -First 1) -split '=',2)[1]
+if (-not $sttProvider) { $sttProvider = 'whisper_turbo' }
+if ($sttProvider -eq 'whisper_turbo') {
+    if (-not (Test-Path (Join-Path $Root 'models\whisper-large-v3-turbo\config.json'))) { Fail 'Falta el modelo Whisper Turbo preparado. Ejecutá scripts\prepare_whisper_turbo.py.' }
+    & $Py scripts\whisper_cuda_smoke.py
+    if ($LASTEXITCODE -ne 0) { Fail 'La validación CUDA de Whisper Turbo falló (BLOCKED_CUDA).' }
+}
 $PiperModel = Get-ChildItem (Join-Path $Root 'models\piper') -Filter '*.onnx' -ErrorAction SilentlyContinue | Select-Object -First 1
 if (-not $PiperModel) { Fail 'No hay modelo Piper (*.onnx) en models\piper.' }
 if (-not (Test-Path (Join-Path $Root 'data\generated\giana.sqlite3'))) { Fail 'Falta data\generated\giana.sqlite3. Ejecutá scripts\ingest.py.' }
@@ -83,7 +95,7 @@ Write-Ok "Qdrant listo ($($collection.result.points_count) vectores)"
 # ---------- 2. Piper ----------
 Write-Step '2/5 Piper TTS'
 if (-not (Port-Listening 5001)) {
-    Start-Service-Process 'piper' $Py @('-m', 'piper.http_server', '--host', '127.0.0.1', '--port', '5001', '--model', $PiperModel.FullName) $Root @{} | Out-Null
+    Start-Service-Process 'piper' $Py @('-m', 'piper.http_server', '--host', '127.0.0.1', '--port', '5001', '--model', ('"' + $PiperModel.FullName + '"')) $Root @{} | Out-Null
 }
 Wait-Until {
     $resp = Invoke-WebRequest 'http://127.0.0.1:5001/synthesize' -Method Post -ContentType 'application/json' -Body '{"text":"Hola"}' -UseBasicParsing -TimeoutSec 15
@@ -104,7 +116,7 @@ Write-Ok 'Backend responde consultas'
 # ---------- 4. Voz ----------
 Write-Step '4/5 Servidor de voz (Pipecat)'
 if (-not (Port-Listening 7860)) {
-    Start-Service-Process 'voice' $Py @('-m', 'voice.bot', '-t', 'webrtc') $Root @{ GIANA_DIAGNOSTICS = 'true'; GIANA_TRACE_SOURCE = 'human'; PYTHONUTF8 = '1'; PIPER_URL = 'http://127.0.0.1:5001/synthesize'; BACKEND_URL = 'http://127.0.0.1:5000' } | Out-Null
+    Start-Service-Process 'voice' $Py @('-m', 'voice.bot', '-t', 'webrtc') $Root @{ GIANA_DIAGNOSTICS = 'true'; GIANA_TRACE_SOURCE = 'human'; PYTHONUTF8 = '1'; TTS_PROVIDER = 'piper'; PIPER_URL = 'http://127.0.0.1:5001/synthesize'; BACKEND_URL = 'http://127.0.0.1:5000'; STT_PROVIDER = $sttProvider; STT_MODEL_PATH = (Join-Path $Root 'models\whisper-large-v3-turbo') } | Out-Null
 }
 Wait-Until {
     $start = Invoke-RestMethod 'http://127.0.0.1:7860/start' -Method Post -ContentType 'application/json' -Body '{"transport":"webrtc","enableDefaultIceServers":true}' -TimeoutSec 10

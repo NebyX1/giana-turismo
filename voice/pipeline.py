@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import re
 import time
 import traceback
 import uuid
@@ -22,7 +23,7 @@ from pipecat.turns.user_start import VADUserTurnStartStrategy
 from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
 from pipecat.turns.user_turn_processor import UserTurnProcessor
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
-from pipecat.services.moonshine.stt import Model, MoonshineSTTService
+from pipecat.services.moonshine.stt import MoonshineSTTService
 from pipecat.services.piper.tts import PiperHttpTTSService
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.livekit.transport import LiveKitParams, LiveKitTransport
@@ -32,11 +33,11 @@ from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 
 from voice.agent import GenerationController
 from voice.trace import trace_event
+from voice.stt import create_stt_service
 
 ROOT = Path(__file__).resolve().parents[1]
 VOICE_DIAGNOSTICS = os.getenv("GIANA_DIAGNOSTICS", "false").lower() == "true"
 VOICE_COUNTERS_PATH = ROOT / "run" / "voice_counters.json"
-CURRENT_TTS_TRACE = {"session_id": "", "turn_id": "", "generation_id": ""}
 CURRENT_TURN_DEBUG = {"session_id": "", "turn_id": "", "generation_id": ""}
 
 # Watchdog de última defensa: si SmartTurn ya decidió COMPLETE y Moonshine
@@ -50,11 +51,12 @@ USER_TURN_STOP_TIMEOUT_SECS = 3.0
 
 # Debe reflejar los mismos términos que WEB_FOLLOWUP en backend/app/intent_router.py.
 _WEB_REQUEST_TERMS = ("buscá en la web", "busca en la web", "buscar en la web", "en internet", "web")
+_WEB_DYNAMIC_TERMS = re.compile(r"\b(eventos?|agenda|cartelera|actividades? culturales?|festivales?|conciertos?|funciones?|está abierto|esta abierto|horario|disponibilidad|vigente|actualizado)\b|\b(esta semana|mañana|manana|hoy|ahora|este mes|próxima semana|proxima semana|fin de semana)\b.*\b(evento|actividad|agenda|cartelera|cultural|abierto|horario|disponibilidad)\b", re.IGNORECASE)
 
 
 def _looks_like_web_request(text: str) -> bool:
     q = text.lower()
-    return any(term in q for term in _WEB_REQUEST_TERMS)
+    return any(term in q for term in _WEB_REQUEST_TERMS) or bool(_WEB_DYNAMIC_TERMS.search(q))
 
 
 class TurnPhase(StrEnum):
@@ -184,9 +186,21 @@ def write_turn_record(record: dict):
 
 def completion_guard_delay(text: str) -> tuple[float, str]:
     normalized = " ".join(text.lower().split())
-    cues = (" y", " pero", " porque", " entonces", " además", " por ejemplo", "quiero", "estoy buscando", "necesito", "algo como", "un lugar donde", "y también")
-    if normalized.endswith(("...", "…")) or any(normalized.endswith(cue) for cue in cues):
+    # STT supplies punctuation even for a syntactically unfinished clause. A dot
+    # is not evidence of completion; check continuation cues before fast closure.
+    stem = normalized.rstrip(" .!¡?¿,;:")
+    cues = (" y", " pero", " porque", " entonces", " además", " por ejemplo", "quiero", "estoy buscando", "necesito", "algo como", "un lugar donde", "y también", "dónde podemos", "donde podemos", "dónde puedo", "donde puedo", "qué podemos", "que podemos", "me gustaría", "me gustaria", "estaba pensando en")
+    if normalized.endswith(("...", "…")) or any(stem.endswith(cue) for cue in cues):
         return 1.1, "long_or_incomplete_cue"
+    # Presence checks are often only a preamble ("Hola, ¿me recibís bien?"
+    # + a factual request after a natural pause). Whisper can emit the second
+    # segment a few hundred milliseconds after the first one. Keep that turn
+    # open without slowing ordinary short factual questions.
+    presence_preamble = any(term in normalized for term in (
+        "me recibís", "me recibis", "me escuchás", "me escuchas",
+        "estás ahí", "estas ahi", "seguís ahí", "seguis ahi", "funcionás", "funcionas"))
+    if presence_preamble:
+        return 0.9, "presence_preamble"
     if len(normalized) < 34 and ("?" in normalized or normalized.endswith((".", "!"))):
         return 0.3, "short_complete"
     if len(normalized) > 90 or normalized.count(" y ") >= 1:
@@ -230,10 +244,12 @@ def bump_voice_counter(name):
 
 
 class GianaRAGProcessor(FrameProcessor):
-    def __init__(self, backend_url="http://localhost:5000", **kwargs):
+    def __init__(self, backend_url="http://localhost:5000", conversation_id=None, **kwargs):
         super().__init__(**kwargs)
         self.backend_url = backend_url.rstrip("/")
         self.controller = GenerationController(f"session-{uuid.uuid4().hex[:10]}")
+        self.conversation_id = conversation_id or self.controller.current.session_id
+        self.tts_trace = {"session_id": self.controller.current.session_id, "turn_id": "", "generation_id": ""}
         self.turn_state = "LISTENING"
         # Barrera de finalización: estado explícito por user turn.
         self.turn: TurnState | None = None
@@ -246,6 +262,16 @@ class GianaRAGProcessor(FrameProcessor):
         # barge-in cancela únicamente ésta, nunca la del turno que empieza.
         self._active_assistant_generation_id: str | None = None
         self.http_client = httpx.AsyncClient(base_url=self.backend_url, timeout=httpx.Timeout(60.0, connect=3.0, read=60.0))
+
+    async def cleanup(self):
+        pending = set(self._tasks)
+        pending.update(t for t in (self._grace_task, self._transcript_watchdog_task) if t)
+        self._cancel_scheduled_tasks("disconnect")
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        await self.http_client.aclose()
+        await super().cleanup()
 
     def _task_done(self, task):
         self._tasks.discard(task)
@@ -272,7 +298,7 @@ class GianaRAGProcessor(FrameProcessor):
             tasks.append(self.turn.grace_task)
             self.turn.grace_task = None
         for task in tasks:
-            if task and not task.done():
+            if task and task is not asyncio.current_task() and not task.done():
                 task.cancel()
         self._transcript_watchdog_task = None
         self._grace_task = None
@@ -285,6 +311,9 @@ class GianaRAGProcessor(FrameProcessor):
         # FrameProcessor override accepts StartFrame but never initializes its
         # internal processing queue, so STT frames stop at the queue boundary.
         await super().process_frame(frame, direction)
+        if direction == FrameDirection.UPSTREAM:
+            await self.push_frame(frame, direction)
+            return
         if type(frame).__name__ in {"StartFrame", "TranscriptionFrame", "InterruptionFrame", "EndFrame", "CancelFrame"}:
             trace_event("voice", "rag_process_frame_enter", detail=f"type={type(frame).__name__} direction={getattr(direction, 'name', direction)}")
         if type(frame).__name__ == "TranscriptionFrame":
@@ -319,7 +348,7 @@ class GianaRAGProcessor(FrameProcessor):
             trace_event("turn", "vad_speech_stopped", session_id=generation.session_id, turn_id=generation.turn_id, generation_id=generation.generation_id, detail=f"stop_secs={frame.stop_secs}", vad="SILENCE")
         if isinstance(frame, UserStartedSpeakingFrame):
             turn = self.turn
-            resume_same_turn = turn is not None and not turn.finalized and turn.text and turn.phase in (TurnPhase.COMPLETE_PENDING, TurnPhase.WAITING_TRANSCRIPT)
+            resume_same_turn = turn is not None and not turn.finalized
             if resume_same_turn:
                 # Barge-in durante grace/watchdog del MISMO turno semántico:
                 # el usuario siguió hablando.  Reabrimos el turno, conservando
@@ -327,6 +356,12 @@ class GianaRAGProcessor(FrameProcessor):
                 # finalizado), así que no cancelamos ninguna generación.
                 self._cancel_scheduled_tasks("speech resumed same turn")
                 turn.speech_active = True
+                # Existing text belongs to the PREVIOUS speech segment. It is
+                # not evidence that STT has finished the resumed audio. Without
+                # resetting this barrier a fast SmartTurn closes on old text
+                # while the second Whisper result is still in flight.
+                turn.transcript_ready = False
+                turn.smart_turn_decision = None
                 turn.phase = TurnPhase.SPEECH
                 trace_event("turn", "speech_resumed", session_id=turn.session_id, turn_id=turn.turn_id, generation_id=turn.generation_id or "", detail="same semantic turn")
             else:
@@ -344,6 +379,7 @@ class GianaRAGProcessor(FrameProcessor):
                 trace_event("turn", "turn_started", session_id=turn.session_id, turn_id=turn.turn_id, generation_id=turn.generation_id, detail="VADUserTurnStartStrategy")
                 self.turn_records[turn.turn_id] = {"turn_id": turn.turn_id, "generation_id": turn.generation_id, "user_segments": [], "user_final_text": "", "turn_state_history": [turn.phase.value], "smart_turn_results": [], "assistant_final_text": "", "tts_segments": [], "tts_full_text": "", "error": None, "timings": {}}
                 write_turn_record(self.turn_records[turn.turn_id])
+            await self._notify_frontend("user_turn_started", {"session_id": turn.session_id, "turn_id": turn.turn_id})
         if isinstance(frame, UserStoppedSpeakingFrame):
             turn = self.turn
             if turn is None or turn.finalized:
@@ -387,6 +423,7 @@ class GianaRAGProcessor(FrameProcessor):
                     record["user_segments"] = list(turn.transcript_segments)
                     write_turn_record(record)
                 trace_event("moonshine", "moonshine_transcript_final", session_id=turn.session_id, turn_id=turn.turn_id, generation_id=turn.generation_id or "", detail=frame.text)
+                await self._notify_frontend("user_transcript_updated", {"session_id": turn.session_id, "turn_id": turn.turn_id, "text": turn.text})
                 await self.try_finalize_turn(turn, source="transcript_final")
             return
         await self.push_frame(frame, direction)
@@ -451,6 +488,8 @@ class GianaRAGProcessor(FrameProcessor):
         # final tardío).  Usamos el texto ACTUAL, no el snapshot del momento
         # en que se programó.
         current_text = turn.text or text
+        if turn.speech_active or not turn.transcript_ready or turn.smart_turn_decision != "COMPLETE":
+            return
         await self._finalize_turn_now(turn, current_text)
 
     async def _finalize_turn_now(self, turn: TurnState, text: str):
@@ -462,6 +501,7 @@ class GianaRAGProcessor(FrameProcessor):
         self.turn_state = "FINALIZED"
         trace_event("turn", "grace_finished", session_id=turn.session_id, turn_id=turn.turn_id, generation_id=turn.generation_id or "", detail="no speech resumed")
         trace_event("turn", "turn_finalized", session_id=turn.session_id, turn_id=turn.turn_id, generation_id=turn.generation_id or "", detail=text, transcript_segments=len(turn.transcript_segments), decision="COMPLETE")
+        await self._notify_frontend("user_turn_finalized", {"session_id": turn.session_id, "turn_id": turn.turn_id, "text": text})
         record = self.turn_records.get(turn.turn_id)
         if record is not None:
             record["user_final_text"] = text
@@ -496,7 +536,7 @@ class GianaRAGProcessor(FrameProcessor):
         started = time.perf_counter()
         trace_event("voice", "backend_request_started", session_id=generation.session_id, turn_id=generation.turn_id, generation_id=generation_id, detail=text)
         try:
-            response = await self.http_client.post("/api/ask-text", json={"question": text, "session_id": generation.session_id, "turn_id": generation.turn_id, "generation_id": generation_id, "source": "human"})
+            response = await self.http_client.post("/api/ask-text", json={"question": text, "session_id": generation.session_id, "conversation_id":self.conversation_id, "turn_id": generation.turn_id, "generation_id": generation_id, "source": "human"})
             status = response.status_code
             payload = response.json()
             trace_event("voice", "backend_json_parsed", session_id=generation.session_id, turn_id=generation.turn_id, generation_id=generation_id, detail=','.join(sorted(payload.keys())))
@@ -513,16 +553,12 @@ class GianaRAGProcessor(FrameProcessor):
         except (httpx.ReadTimeout, httpx.ConnectTimeout):
             trace_event("voice", "backend_request_timeout", session_id=generation.session_id, turn_id=generation.turn_id, generation_id=generation_id, status="error", detail="backend request timeout", elapsed_ms=round((time.perf_counter() - started) * 1000, 2))
             if self.controller.is_current(generation_id):
-                await self.push_frame(LLMFullResponseStartFrame(), FrameDirection.DOWNSTREAM)
-                await self.push_frame(LLMTextFrame("El modelo tardó demasiado en responder. Probá nuevamente."), FrameDirection.DOWNSTREAM)
-                await self.push_frame(LLMFullResponseEndFrame(), FrameDirection.DOWNSTREAM)
+                await self._emit_assistant_answer(text, generation, {"answer": "El modelo tardó demasiado en responder. Probá nuevamente."}, started)
         except Exception as exc:
             trace_event("voice", "backend_request_failed", session_id=generation.session_id, turn_id=generation.turn_id, generation_id=generation_id, status="error", detail=f"{type(exc).__name__}: {exc}", elapsed_ms=round((time.perf_counter() - started) * 1000, 2))
             print(traceback.format_exc(), flush=True)
             if self.controller.is_current(generation_id):
-                await self.push_frame(LLMFullResponseStartFrame(), FrameDirection.DOWNSTREAM)
-                await self.push_frame(LLMTextFrame("No pude consultar la guía en este momento."), FrameDirection.DOWNSTREAM)
-                await self.push_frame(LLMFullResponseEndFrame(), FrameDirection.DOWNSTREAM)
+                await self._emit_assistant_answer(text, generation, {"answer": "Tuve un problema técnico al preparar la respuesta. Sigo escuchándote; podés volver a preguntarme.", "state":"SYSTEM_ERROR"}, started)
 
     async def _emit_assistant_answer(self, text, generation, payload, started):
         generation_id = generation.generation_id
@@ -531,7 +567,7 @@ class GianaRAGProcessor(FrameProcessor):
         response_buffer.append(answer)
         canonical_answer = response_buffer.finalize()
         answer = canonical_answer
-        CURRENT_TTS_TRACE.update(session_id=generation.session_id, turn_id=generation.turn_id, generation_id=generation_id, tts_source_text=canonical_answer)
+        self.tts_trace.update(session_id=generation.session_id, turn_id=generation.turn_id, generation_id=generation_id, tts_source_text=canonical_answer)
         trace_event("voice", "assistant_response_buffer_finalized", session_id=generation.session_id, turn_id=generation.turn_id, generation_id=generation_id, detail=f"chars={len(canonical_answer)}", assistant_final_text=canonical_answer)
         record = self.turn_records.get(generation.turn_id)
         if record is not None:
@@ -539,12 +575,13 @@ class GianaRAGProcessor(FrameProcessor):
             record["timings"]["backend_ms"] = round((time.perf_counter() - started) * 1000, 2)
             write_turn_record(record)
         trace_event("voice", "assistant_answer_extracted", session_id=generation.session_id, turn_id=generation.turn_id, generation_id=generation_id, detail=f"answer_length={len(answer)}")
+        await self._notify_frontend("assistant_response_finalized", {"session_id": generation.session_id, "turn_id": generation.turn_id, "generation_id": generation_id, "text": answer, "sources": payload.get("evidence") or payload.get("searched_sources", []), "route": payload.get("route"), "time_context": payload.get("time_context"), "requested_window": payload.get("requested_window"), "web_invoked": payload.get("web_invoked", False), "state": payload.get("state")})
         trace_event("voice", "assistant_text_frame_created", session_id=generation.session_id, turn_id=generation.turn_id, generation_id=generation_id, detail=answer)
         # RTVI emits bot-llm events from these frames; the old code only sent
         # TTSSpeakFrame, so the UI never left RETRIEVING and no assistant text
         # was visible even when the backend had answered.
         trace_event("voice", "assistant_frame_pushed", session_id=generation.session_id, turn_id=generation.turn_id, generation_id=generation_id, detail="LLMFullResponseStartFrame,LLMTextFrame,LLMFullResponseEndFrame")
-        CURRENT_TTS_TRACE.update(session_id=generation.session_id, turn_id=generation.turn_id, generation_id=generation_id)
+        self.tts_trace.update(session_id=generation.session_id, turn_id=generation.turn_id, generation_id=generation_id)
         await self.push_frame(LLMFullResponseStartFrame(), FrameDirection.DOWNSTREAM)
         await self.push_frame(LLMTextFrame(answer), FrameDirection.DOWNSTREAM)
         await self.push_frame(LLMFullResponseEndFrame(), FrameDirection.DOWNSTREAM)
@@ -569,21 +606,30 @@ class TracedMoonshineSTTService(MoonshineSTTService):
 
 
 class TracedPiperTTSService(PiperHttpTTSService):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, trace_context=None, **kwargs):
+        self._trace_context = trace_context if trace_context is not None else {}
         sample_rate = kwargs.get("sample_rate")
         super().__init__(*args, **kwargs)
         if sample_rate:
             self._sample_rate = sample_rate
 
+    async def cleanup(self):
+        try:
+            await super().cleanup()
+        finally:
+            await self._session.close()
+
     async def run_tts(self, text: str, context_id: str):
-        ids = dict(CURRENT_TTS_TRACE)
-        trace_event("tts", "tts_input_received", **ids, detail=f"text_length={len(text)}")
+        ids = dict(self._trace_context)
+        trace_event("tts", "tts_input_received", **ids, detail=f"text_length={len(text)}", tts_text=text)
         trace_event("piper", "piper_request_started", **ids, detail=f"text_length={len(text)}")
         started = time.perf_counter()
         audio_started = False
+        audio_bytes = 0
         try:
             async for frame in super().run_tts(text, context_id):
                 if isinstance(frame, TTSAudioRawFrame):
+                    audio_bytes += len(frame.audio)
                     if not audio_started:
                         audio_started = True
                         trace_event("tts", "tts_audio_received", **ids, detail=f"bytes={len(frame.audio)}", elapsed_ms=round((time.perf_counter() - started) * 1000, 2))
@@ -607,25 +653,25 @@ class TracedPiperTTSService(PiperHttpTTSService):
                     except (OSError, json.JSONDecodeError):
                         pass
             trace_event("piper", "piper_response_received", **ids, detail="audio stream completed", elapsed_ms=round((time.perf_counter() - started) * 1000, 2))
-            trace_event("voice", "turn_finished", **ids, detail="tts/audio complete", elapsed_ms=round((time.perf_counter() - started) * 1000, 2))
+            trace_event("voice", "tts_segment_completed", **ids, detail="tts segment synthesized", tts_text=text, audio_bytes=audio_bytes, elapsed_ms=round((time.perf_counter() - started) * 1000, 2))
         except Exception as exc:
             trace_event("piper", "piper_exception", **ids, status="error", detail=f"{type(exc).__name__}: {exc}", elapsed_ms=round((time.perf_counter() - started) * 1000, 2))
             raise
 
 
-def build_smallwebrtc_pipeline(connection, backend_url=None):
+def build_smallwebrtc_pipeline(connection, backend_url=None, conversation_id=None):
     backend_url = backend_url or os.getenv("BACKEND_URL", "http://localhost:5000")
     transport = SmallWebRTCTransport(connection, TransportParams(audio_in_enabled=True, audio_out_enabled=True, audio_in_sample_rate=16000, audio_out_sample_rate=16000, audio_out_channels=1))
     vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(params=VADParams(confidence=0.6, start_secs=0.1, stop_secs=0.6, min_volume=0.2)))
-    stt = TracedMoonshineSTTService(settings=TracedMoonshineSTTService.Settings(model=Model.BASE_STREAMING, language=Language.ES))
+    stt = create_stt_service()
     smart_turn = TracedSmartTurnAnalyzer(cpu_count=1, params=SmartTurnParams(stop_secs=1.5))
     turn_manager = UserTurnProcessor(user_turn_strategies=UserTurnStrategies(start=[VADUserTurnStartStrategy()], stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=smart_turn, wait_for_transcript=False)]), user_turn_stop_timeout=USER_TURN_STOP_TIMEOUT_SECS)
-    rag = GianaRAGProcessor(backend_url=backend_url)
-    session = aiohttp.ClientSession()
+    rag = GianaRAGProcessor(backend_url=backend_url, conversation_id=conversation_id)
     piper_url = os.getenv("PIPER_URL", "http://piper:5000/synthesize")
     if not piper_url.rstrip("/").endswith("/synthesize"):
         piper_url = piper_url.rstrip("/") + "/synthesize"
-    tts = TracedPiperTTSService(base_url=piper_url, aiohttp_session=session, sample_rate=16000, settings=TracedPiperTTSService.Settings(voice=os.getenv("PIPER_VOICE", "es_AR-daniela-high"), language=Language.ES))
+    session = aiohttp.ClientSession()
+    tts = TracedPiperTTSService(base_url=piper_url, aiohttp_session=session, sample_rate=16000, trace_context=rag.tts_trace, settings=TracedPiperTTSService.Settings(voice=os.getenv("PIPER_VOICE", "es_AR-daniela-high"), language=Language.ES))
     return transport, Pipeline([transport.input(), vad, stt, turn_manager, rag, tts, transport.output()])
 
 
@@ -633,13 +679,13 @@ def build_livekit_pipeline(url, token, room_name, backend_url=None):
     backend_url = backend_url or os.getenv("BACKEND_URL", "http://localhost:5000")
     transport = LiveKitTransport(url=url, token=token, room_name=room_name, params=LiveKitParams(audio_in_enabled=True, audio_out_enabled=True, audio_in_sample_rate=16000, audio_out_sample_rate=16000, audio_out_channels=1))
     vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(params=VADParams(confidence=0.6, start_secs=0.1, stop_secs=0.6, min_volume=0.2)))
-    stt = TracedMoonshineSTTService(settings=TracedMoonshineSTTService.Settings(model=Model.BASE_STREAMING, language=Language.ES))
+    stt = create_stt_service()
     smart_turn = TracedSmartTurnAnalyzer(cpu_count=1, params=SmartTurnParams(stop_secs=1.5))
     turn_manager = UserTurnProcessor(user_turn_strategies=UserTurnStrategies(start=[VADUserTurnStartStrategy()], stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=smart_turn, wait_for_transcript=False)]), user_turn_stop_timeout=USER_TURN_STOP_TIMEOUT_SECS)
     rag = GianaRAGProcessor(backend_url=backend_url)
-    session = aiohttp.ClientSession()
     piper_url = os.getenv("PIPER_URL", "http://piper:5000/synthesize")
     if not piper_url.rstrip("/").endswith("/synthesize"):
         piper_url = piper_url.rstrip("/") + "/synthesize"
-    tts = TracedPiperTTSService(base_url=piper_url, aiohttp_session=session, sample_rate=16000, settings=TracedPiperTTSService.Settings(voice=os.getenv("PIPER_VOICE", "es_AR-daniela-high"), language=Language.ES))
+    session = aiohttp.ClientSession()
+    tts = TracedPiperTTSService(base_url=piper_url, aiohttp_session=session, sample_rate=16000, trace_context=rag.tts_trace, settings=TracedPiperTTSService.Settings(voice=os.getenv("PIPER_VOICE", "es_AR-daniela-high"), language=Language.ES))
     return transport, Pipeline([transport.input(), vad, stt, turn_manager, rag, tts, transport.output()])

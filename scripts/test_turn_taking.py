@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from voice.pipeline import UserTurnBuffer
+from voice.pipeline import UserTurnBuffer, completion_guard_delay
 
 
 def one_turn(parts):
@@ -20,5 +20,7 @@ assert segments == 2
 assert one_turn(["Quiero ir a Villa Serrana y", "Quiero ir a Villa Serrana y"])[0].count("Villa Serrana") == 1
 assert one_turn(["Estoy buscando...", "un lugar para alojarme cerca del Penitente."])[0].endswith("Penitente.")
 assert one_turn(["Quiero ir a...", "eh...", "Villa Serrana."])[0] == "Quiero ir a... eh... Villa Serrana."
+assert completion_guard_delay("Hola, ¿me recibís bien?") == (0.9, "presence_preamble")
+assert completion_guard_delay("¿Cuál es el teléfono?") == (0.3, "short_complete")
 
-print("TURN_TAKING_BUFFER_PASS cases=4 backend_call_count=1")
+print("TURN_TAKING_BUFFER_PASS cases=6 backend_call_count=1")

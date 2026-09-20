@@ -63,6 +63,12 @@ command -v curl   >/dev/null || fail 'curl no está instalado.'
 command -v ss     >/dev/null || fail 'ss (iproute2) no está instalado.'
 [[ -f "$ROOT/.env" ]] || fail 'Falta .env en la raíz (OLLAMA_API_KEY es obligatoria).'
 grep -qE '^OLLAMA_API_KEY=.+' "$ROOT/.env" || fail 'OLLAMA_API_KEY no está definida en .env.'
+STT_PROVIDER="$(grep -E '^STT_PROVIDER=' "$ROOT/.env" | head -n1 | cut -d= -f2- || true)"
+STT_PROVIDER="${STT_PROVIDER:-whisper_turbo}"
+if [[ "$STT_PROVIDER" == "whisper_turbo" ]]; then
+  [[ -f "$ROOT/models/whisper-large-v3-turbo/config.json" ]] || fail 'Falta el modelo Whisper Turbo preparado. Ejecutá scripts/prepare_whisper_turbo.py.'
+  "$PY" scripts/whisper_cuda_smoke.py || fail 'La validación CUDA de Whisper Turbo falló (BLOCKED_CUDA).'
+fi
 PIPER_MODEL="$(ls "$ROOT"/models/piper/*.onnx 2>/dev/null | head -n1 || true)"
 [[ -n "$PIPER_MODEL" ]] || fail 'No hay modelo Piper (*.onnx) en models/piper.'
 [[ -f "$ROOT/data/generated/giana.sqlite3" ]] || fail 'Falta data/generated/giana.sqlite3. Ejecutá scripts/ingest.py.'
@@ -82,14 +88,8 @@ ok "Qdrant listo ($points vectores)"
 
 # ---------- 2. Piper ----------
 step '2/5 Piper TTS'
-if ! port_listening 5001; then
-  start_bg piper "$PY" -m piper.http_server --host 127.0.0.1 --port 5001 --model "$PIPER_MODEL"
-fi
-piper_probe() {
-  local bytes
-  bytes="$(curl -fsS -X POST 'http://127.0.0.1:5001/synthesize' -H 'Content-Type: application/json' -d '{"text":"Hola"}' --max-time 15 | wc -c)"
-  (( bytes > 1000 ))
-}
+if ! port_listening 5001; then start_bg piper "$PY" -m piper.http_server --host 127.0.0.1 --port 5001 --model "$PIPER_MODEL"; fi
+piper_probe() { local bytes; bytes="$(curl -fsS -X POST 'http://127.0.0.1:5001/synthesize' -H 'Content-Type: application/json' -d '{"text":"Hola"}' --max-time 15 | wc -c)"; (( bytes > 1000 )); }
 wait_until 90 'Piper (síntesis de prueba)' piper_probe
 ok 'Piper sintetiza audio'
 
@@ -109,7 +109,7 @@ ok 'Backend responde consultas'
 step '4/5 Servidor de voz (Pipecat)'
 if ! port_listening 7860; then
   GIANA_DIAGNOSTICS=true GIANA_TRACE_SOURCE=human PYTHONUTF8=1 \
-  PIPER_URL='http://127.0.0.1:5001/synthesize' BACKEND_URL='http://127.0.0.1:5000' \
+    TTS_PROVIDER='piper' PIPER_URL='http://127.0.0.1:5001/synthesize' BACKEND_URL='http://127.0.0.1:5000' STT_PROVIDER="$STT_PROVIDER" STT_MODEL_PATH="$ROOT/models/whisper-large-v3-turbo" \
   start_bg voice "$PY" -m voice.bot -t webrtc
 fi
 voice_probe() {

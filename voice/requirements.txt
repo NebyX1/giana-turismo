@@ -1,1 +1,3 @@
-pipecat-ai[moonshine,piper,webrtc,livekit,runner]
+pipecat-ai[moonshine,whisper,piper,webrtc,livekit,runner]==1.10.0
+faster-whisper==1.2.1
+ctranslate2==4.8.2

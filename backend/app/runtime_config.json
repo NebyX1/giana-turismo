@@ -1,0 +1,8 @@
+{
+  "router_mode": "tools",
+  "router_model": "deepseek-v4.1-flash:cloud",
+  "answer_model": "deepseek-v4.1-flash:cloud",
+  "fallback_model": "gemma4:31b-cloud",
+  "web_search_provider": "ddgs_with_ollama_fallback",
+  "web_research_mode": "agent_tools"
+}

@@ -4,10 +4,14 @@ export type MessageRole = 'user' | 'assistant' | 'system_status';
 
 export type EvidenceSource = {
   title: string;
-  start_line: number;
-  end_line: number;
-  source_refs?: number[];
-  text: string;
+  start_line?: number | null;
+  end_line?: number | null;
+  source_refs?: (number | string)[];
+  text?: string;
+  url?: string;
+  kind?: string;
+  retrieved_at?: string;
+  consulted_only?: boolean;
 };
 
 export type ConversationMessage = {

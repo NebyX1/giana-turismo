@@ -1,11 +1,12 @@
 import { useEffect, useRef } from 'react';
-import { RTVIEvent, PipecatClient } from '@pipecat-ai/client-js';
+import { PipecatClient } from '@pipecat-ai/client-js';
 import { SmallWebRTCTransport } from '@pipecat-ai/small-webrtc-transport';
 import { useConversationStore } from './store';
 import type { ConversationState } from './types';
+import { applyTurnMessage } from './voiceMessages';
 
 export const stateLabel: Record<ConversationState, string> = {
-  IDLE: '', CONNECTING: 'Conectando…', LISTENING: 'Escuchando…', TRANSCRIBING: 'Procesando lo que dijiste…', WAITING_TRANSCRIPT: 'Procesando lo que dijiste…', RETRIEVING: 'Buscando en la guía de Lavalleja…', THINKING: 'Pensando…', WEB_SEARCHING: 'Buscando en la web…', SPEAKING: 'Giana está hablando', INTERRUPTED: '', ERROR: 'No pude completar esa acción. Probá de nuevo.',
+  IDLE: '', CONNECTING: 'Conectando…', LISTENING: 'Escuchando…', TRANSCRIBING: 'Procesando lo que dijiste…', WAITING_TRANSCRIPT: 'Procesando lo que dijiste…', RETRIEVING: 'Buscando en la guía de Lavalleja…', THINKING: 'Pensando…', WEB_SEARCHING: 'Buscando en la web…', SPEAKING: 'Gianna está hablando', INTERRUPTED: '', ERROR: 'No pude completar esa acción. Probá de nuevo.',
 };
 
 export function useAutoScroll<T extends HTMLElement>(dependency: unknown) {
@@ -21,14 +22,10 @@ export function useVoiceSession() {
   const connectingPromise = useRef<Promise<void> | null>(null);
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
   const remoteStreamRef = useRef<MediaStream | null>(null);
-  const assistantId = useRef<string | null>(null);
-  const assistantText = useRef('');
-  const assistantFinalized = useRef(false);
-  const turnCounter = useRef(0);
   const activeTurnId = useRef('');
   const store = useConversationStore();
   const setState = store.setVoiceState;
-  const trace = (event: string, detail = '', status = 'ok') => { const params = new URLSearchParams(window.location.search); if (params.get('debug') === '1' || status === 'error') { void fetch('/api/debug/trace', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ component: 'frontend', event, source: 'human', qa_session_id: params.get('qa_session') || '', session_id: store.conversationId, turn_id: activeTurnId.current, generation_id: store.currentGenerationId || '', status, detail }) }).catch(() => undefined); } };
+  const trace = (event: string, detail = '', status = 'ok') => { const current = useConversationStore.getState(); const params = new URLSearchParams(window.location.search); if (params.get('debug') === '1' || status === 'error') { void fetch('/api/debug/trace', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ component: 'frontend', event, source: 'human', qa_session_id: params.get('qa_session') || '', session_id: current.voiceSessionId || current.conversationId, turn_id: activeTurnId.current, generation_id: current.currentGenerationId || '', status, detail }) }).catch(() => undefined); } };
 
   useEffect(() => {
     const audio = document.createElement('audio');
@@ -54,7 +51,9 @@ export function useVoiceSession() {
     if (client.current?.connected) { client.current.enableMic(true); setState('LISTENING'); return; }
     const connection = (async () => {
       trace('frontend_mic_clicked'); setState('CONNECTING'); store.setConnectionState('connecting'); trace('frontend_webrtc_connect_start');
-      const transport = new SmallWebRTCTransport({ waitForICEGathering: true });
+      // Trickle ICE is supported by /api/offer PATCH. Waiting for gathering
+      // makes this SDK renegotiate while the cold server is still connecting.
+      const transport = new SmallWebRTCTransport({ waitForICEGathering: false });
       const pc = new PipecatClient({ transport, enableMic: true, enableCam: false, callbacks: {
       onConnected: () => { store.setConnectionState('connected'); setState('LISTENING'); trace('frontend_webrtc_connected'); },
       onBotStarted: () => trace('frontend_bot_started'),
@@ -80,19 +79,27 @@ export function useVoiceSession() {
       onDisconnected: () => { store.setConnectionState('disconnected'); setState('IDLE'); },
       onTransportStateChanged: (state) => { if (state === 'error') { store.setConnectionState('error'); setState('ERROR'); trace('frontend_error_received', 'transport error', 'error'); } },
       onError: (message) => { const detail = typeof message === 'string' ? message : JSON.stringify(message).slice(0, 500); store.setConnectionState('error'); setState('ERROR'); trace('frontend_error_received', detail || 'client error', 'error'); },
-      onUserStartedSpeaking: () => { turnCounter.current += 1; activeTurnId.current = `turn-${String(turnCounter.current).padStart(4, '0')}`; setState('LISTENING'); assistantId.current = null; assistantText.current = ''; assistantFinalized.current = false; trace('frontend_user_started_speaking', activeTurnId.current); },
+      onUserStartedSpeaking: () => { setState('LISTENING'); trace('frontend_user_started_speaking', activeTurnId.current); },
       onUserStoppedSpeaking: () => setState('WAITING_TRANSCRIPT'),
       // Sección 9-10: el transcript visible NO significa que RAG esté
       // trabajando.  RETRIEVING sólo puede comenzar con backend_dispatch_started
       // (server-message del voice, disparado junto al dispatch real al backend).
-      onUserTranscript: (data) => { store.setLiveTranscript(data.text); if (data.final && data.text.trim()) { store.addUserMessage(data.text.trim()); store.setLiveTranscript(''); setState('WAITING_TRANSCRIPT'); trace('frontend_user_message_visible', data.text.trim()); trace('frontend_status_changed', 'WAITING_TRANSCRIPT'); } },
-      onServerMessage: (data: unknown) => { const event = (data as { event?: string; turn_id?: string; generation_id?: string; error_code?: string }) || {}; switch (event.event) { case 'backend_dispatch_started': store.setGenerationId(event.generation_id || null); setState('RETRIEVING'); trace('frontend_status_changed', 'RETRIEVING', 'ok'); break; case 'web_search_started': setState('WEB_SEARCHING'); trace('frontend_status_changed', 'WEB_SEARCHING', 'ok'); break; case 'stt_transcript_missing': setState('ERROR'); trace('frontend_status_changed', 'STT_TRANSCRIPT_MISSING_AFTER_TURN_COMPLETE', 'error'); break; default: break; } },
-      onBotLlmStarted: () => { setState('THINKING'); assistantText.current = ''; assistantFinalized.current = false; trace('frontend_status_changed', 'THINKING'); assistantId.current = store.addAssistantMessage('', undefined, true); trace('frontend_assistant_message_created'); },
-      onBotLlmText: (data) => { if (!assistantId.current) assistantId.current = store.addAssistantMessage('', undefined, true); assistantText.current += data.text; store.appendAssistantText(assistantId.current, data.text); trace('frontend_assistant_text_received', data.text); },
-      onBotTtsStarted: () => { setState('SPEAKING'); trace('frontend_tts_synthesizing'); }, onBotTtsStopped: () => { setState('LISTENING'); if (!assistantFinalized.current && assistantId.current) { assistantFinalized.current = true; store.finishAssistant(assistantId.current, assistantText.current); trace('frontend_assistant_message_finalized', assistantText.current); } trace('frontend_tts_done'); },
+      onUserTranscript: (data) => { if (!data.final) store.setLiveTranscript(data.text); },
+      onServerMessage: (data: unknown) => { const event = applyTurnMessage(data); if (!event) return; if (event.turn_id) activeTurnId.current = event.turn_id; switch (event.event) {
+        case 'user_turn_started': setState('LISTENING'); break;
+        case 'user_transcript_updated': trace('frontend_user_message_visible', event.text || ''); break;
+        case 'user_turn_finalized': trace('frontend_user_message_finalized', event.text || ''); break;
+        case 'assistant_response_finalized': trace('frontend_assistant_message_finalized', event.text || ''); break;
+        case 'backend_dispatch_started': store.setGenerationId(event.generation_id || null); setState('RETRIEVING'); break;
+        case 'web_search_started': setState('WEB_SEARCHING'); break;
+        case 'stt_transcript_missing': setState('ERROR'); trace('frontend_status_changed', 'STT_TRANSCRIPT_MISSING_AFTER_TURN_COMPLETE', 'error'); break;
+      } },
+      onBotLlmStarted: () => { setState('THINKING'); trace('frontend_status_changed', 'THINKING'); },
+      onBotLlmText: (data) => { trace('frontend_assistant_text_received', data.text); },
+      onBotTtsStarted: () => { trace('frontend_tts_synthesizing'); }, onBotTtsStopped: () => { trace('frontend_tts_done'); },
       onBotStartedSpeaking: () => { setState('SPEAKING'); trace('frontend_transport_sending_audio'); }, onBotStoppedSpeaking: () => { setState('LISTENING'); trace('frontend_transport_audio_done'); },
       onLocalAudioLevel: (level) => store.setAudioLevel(level),
-      onBotOutput: (data) => { const canonical = assistantText.current || data.text || ''; if (canonical && assistantId.current) { assistantFinalized.current = true; store.finishAssistant(assistantId.current, canonical); trace('frontend_assistant_message_finalized', canonical); } },
+      onBotOutput: (data) => { trace('frontend_spoken_text_received', data.text || ''); },
       } });
       client.current = pc;
       try {
@@ -101,7 +108,7 @@ export function useVoiceSession() {
         // only the connection bootstrap watchdog, not turn finalization.
         const timeout = new Promise<never>((_, reject) => { timeoutId = window.setTimeout(() => reject(new Error('WEBRTC_CONNECTION_TIMEOUT')), 30000); });
         trace('voice_start_requested', JSON.stringify({ endpoint: 'http://localhost:7860/start', origin: window.location.origin }));
-        try { await Promise.race([pc.startBotAndConnect({ endpoint: 'http://localhost:7860/start', requestData: { transport: 'webrtc', enableDefaultIceServers: true } }), timeout]); trace('voice_start_response', 'ok'); }
+        try { await Promise.race([pc.startBotAndConnect({ endpoint: 'http://localhost:7860/start', requestData: { transport: 'webrtc', enableDefaultIceServers: true, body: { conversation_id: useConversationStore.getState().conversationId } } }), timeout]); trace('voice_start_response', 'ok'); }
         finally { if (timeoutId !== undefined) window.clearTimeout(timeoutId); }
       }
       catch (error) { const detail = error instanceof Error ? error.message : String(error); const code = detail.includes('Failed to fetch') ? 'VOICE_START_FETCH_ERROR' : detail.includes('WEBRTC') ? 'WEBRTC_ERROR' : 'SIGNALING_ERROR'; trace('frontend_connect_failed', JSON.stringify({ error_code: code, detail }), 'error'); store.setConnectionState('error'); setState('ERROR'); await pc.disconnect().catch(() => undefined); if (client.current === pc) client.current = null; throw new Error(`No pude conectar la sesión de voz: ${detail}`); }

@@ -1,0 +1,35 @@
+[
+ {"name":"presence_then_facts","turns":[
+  {"q":"Hola Giana, ¿estás ahí?","route":"CONVERSATION","all":["escucho"]},
+  {"q":"Buenas, quiero un sitio para comer carne a la parrilla dentro de Minas","all":["jorgito","pololo"]},
+  {"q":"Me interesa Don Jorgito, ¿en qué calle queda?","all":["947","varela"]},
+  {"q":"Gracias Giana, ¿seguís ahí?","route":"CONVERSATION"},
+  {"q":"Pasame el número de ese lugar para llamar","regex":"94\\D*710\\D*608"},
+  {"q":"¿Y qué día y hora es ahora?","route":"CLOCK"}]},
+ {"name":"mixed_greetings_diet","turns":[
+  {"q":"Hola, ¿funcionás? Necesito comer algo vegano en Minas","all":["don tadeo"]},
+  {"q":"No, me equivoqué, necesito opciones sin gluten en la misma ciudad","all":["chivas"]},
+  {"q":"Gracias por la ayuda, hasta después","route":"CONVERSATION"},
+  {"q":"Volví. Para tomar un helado sin gluten, ¿dónde voy en Minas?","all":["treat"]}]},
+ {"name":"policies_correction","turns":[
+  {"q":"¿El camping del Penitente dispone de conexión eléctrica?","all":["electric"],"regex":"(no|sin)"},
+  {"q":"Perdón, quise decir el Camping Arequita. ¿Tiene?","all":["electric"],"regex":"(si|tiene|dispone)"},
+  {"q":"¿Y puedo llevar un perro al Salto del Penitente?","all":["correa"]},
+  {"q":"¿Y al Parque Salus?","all":["mascota"],"regex":"no (se )?(admit|permit|podes|esta permitido)"}]},
+ {"name":"freshness_and_scope","turns":[
+  {"q":"¿Qué eventos culturales hay en octubre de 2026 en Minas?","route":"WEB_SEARCH","all":["semana de lavalleja","octubre"]},
+  {"q":"¿Y mañana?","route":"WEB_SEARCH","window":{"start":"2026-09-20","end":"2026-09-20"},"allow_unconfirmed":true},
+  {"q":"¿Y en Mariscala?","route":"WEB_SEARCH","window":{"start":"2026-09-20","end":"2026-09-20"},"allow_unconfirmed":true},
+  {"q":"Buscá restaurantes en Madrid","route":"OUT_OF_SCOPE"},
+  {"q":"Mejor contame del Cerro Artigas en Minas","all":["artigas"]}]},
+ {"name":"missing_data_no_web","turns":[
+  {"q":"¿Cuál es el menú y precio de hoy en Don Jorgito en Minas?","web":true,"allow_unconfirmed":true},
+  {"q":"No busques en internet. Dame la dirección de Don Jorgito según la guía","web":false,"all":["varela","947"]},
+  {"q":"Hola hola, probando uno dos tres","route":"CONVERSATION"},
+  {"q":"¿Qué podés contarme del Cerro Arequita?","all":["arequita"]}]},
+ {"name":"independent_place_after_topic_changes","turns":[
+  {"q":"Buscá en la web eventos culturales en Minas","web":true,"all":["semana de lavalleja"]},
+  {"q":"¿Qué podés contarme del Cerro Arequita?","all":["arequita"]},
+  {"q":"Quiero saber dónde podemos. Comer algo vegano en Minas.","all":["don tadeo"]},
+  {"q":"Puedo llevar un perro al penitente.","web":false,"all":["correa"]}]}
+]
