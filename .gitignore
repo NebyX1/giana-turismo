@@ -47,6 +47,17 @@ embeddings_cache/
 embedding_cache/
 data/*
 !data/.gitkeep
+!data/source/
+!data/source/**
+!data/generated/
+!data/generated/giana.sqlite3
+!data/generated/blocks.jsonl
+!data/generated/chunks.jsonl
+!data/generated/catalog.jsonl
+!data/generated/faq.jsonl
+!data/generated/sources.jsonl
+!data/generated/aliases.json
+!data/generated/manifest.json
 storage/*
 !storage/.gitkeep
 

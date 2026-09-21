@@ -11,15 +11,19 @@ Frontend React/Vite y lockfile; backend Flask; servicio Pipecat/SmallWebRTC; int
 
 ## Excluido
 
-Secretos y `.env` reales; modelos y pesos; voz Piper ONNX; corpus y datasets; SQLite/índices/vectores generados; almacenamiento Qdrant; caches; `node_modules`; virtualenv; logs, traces, reportes generados, audios y builds.
+Secretos y `.env` reales; modelos y pesos; voz Piper ONNX; almacenamiento
+persistente Qdrant; caches; `node_modules`; virtualenv; logs, traces, reportes
+generados, audios y builds. El corpus turístico y los derivados pequeños de la
+ingesta (`data/generated/giana.sqlite3` y vistas JSONL) sí forman parte del repo.
 
 ## Reconstrucción
 
 1. Copiar `.env.example` a `.env` y completar la clave de Ollama Cloud.
 2. Ejecutar `bash scripts/bootstrap.sh`.
-3. Aportar externamente el corpus en `data/source/` y los modelos/voz requeridos.
-4. Ejecutar `python scripts/ingest.py` y `python scripts/index_qdrant.py`.
-5. Levantar Qdrant y ejecutar `bash scripts/start_giana_clean.sh`.
+3. Instalar o aportar externamente los modelos y la voz requeridos.
+4. Levantar Qdrant; la SQLite y el corpus ya están en `data/`.
+5. Ejecutar `python scripts/index_qdrant.py` o dejar que el launcher indexe Qdrant si la colección está vacía.
+6. Ejecutar `bash scripts/start_giana_clean.sh` o `scripts/start_production.ps1` en Windows.
 
 ## Tamaño y conteo
 

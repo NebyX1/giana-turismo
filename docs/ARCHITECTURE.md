@@ -108,7 +108,12 @@ consulta original
 	-> respuesta validada por contrato
 ```
 
-Granite produce vectores de 384 dimensiones. La colección y SQLite son artefactos runtime generados desde el corpus; no se versionan. El backend serializa el acceso a los modelos CUDA con un lock y los carga/calienta antes de aceptar tráfico en el arranque de producción.
+Granite produce vectores de 384 dimensiones. El corpus Markdown y la SQLite FTS5
+con sus vistas JSONL pequeñas se versionan como base de conocimiento reproducible.
+La colección Qdrant es un artefacto binario/runtime y no se versiona; se reconstruye
+con `scripts/index_qdrant.py` usando los chunks incluidos. El backend serializa el
+acceso a los modelos CUDA con un lock y los carga/calienta antes de aceptar tráfico
+en el arranque de producción.
 
 ## Web y tiempo
 
@@ -130,4 +135,11 @@ Endpoints principales: `/api/ask-text`, `/api/time`, `/ready`, `/health`, `/api/
 
 ## Límites del snapshot
 
-GitHub contiene código, configuración de ejemplo, scripts, tests y documentación. Quedan fuera deliberadamente `.env` reales, claves, corpus, SQLite runtime, colección Qdrant, modelos/pesos, voz ONNX, caches, logs, traces, audios, builds, `node_modules` y virtualenvs. En la instalación Windows actual esos artefactos sí están preparados localmente: `models/whisper-large-v3-turbo`, `models/piper/es_AR-daniela-high.onnx`, `data/source` y `data/generated`. Una instalación nueva debe prepararlos con `scripts/ingest.py`, `scripts/index_qdrant.py` y `scripts/prepare_whisper_turbo.py` cuando corresponda.
+GitHub contiene código, configuración de ejemplo, scripts, tests, documentación,
+el corpus Markdown y los derivados pequeños de SQLite/JSONL necesarios para el
+RAG lexical. Quedan fuera deliberadamente `.env` reales, claves, colección
+Qdrant, modelos/pesos, voz ONNX, caches, logs, traces, audios, builds,
+`node_modules` y virtualenvs. En la instalación Windows actual los modelos y la
+voz están preparados localmente en `models/`; una instalación nueva debe
+obtenerlos y, después, ejecutar `scripts/index_qdrant.py` o dejar que el launcher
+lo haga si la colección está vacía.

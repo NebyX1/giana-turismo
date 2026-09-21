@@ -1,0 +1,11 @@
+{
+  "source_path": "data\\source\\Guia_Turistica_Lavalleja_Consolidada_v4(2).md",
+  "sha256": "9e156bf315db9340edefe9fb12aa93eab0a67e48d447f922ba584de339ddfc41",
+  "ingested_at": "2026-09-18T02:00:24.661860+00:00",
+  "parser_version": "m1-deterministic-1",
+  "blocks": 510,
+  "chunks": 555,
+  "catalog": 133,
+  "faq": 34,
+  "sources": 243
+}

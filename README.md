@@ -1,6 +1,6 @@
 # Giana Turismo
 
-Asistente turístico de Lavalleja con frontend React/Vite, voz en tiempo real y RAG híbrido local. Este snapshot contiene el core reproducible; no incluye corpus, índices, bases runtime, pesos ni secretos.
+Asistente turístico de Lavalleja con frontend React/Vite, voz en tiempo real y RAG híbrido local. Este repositorio incluye el corpus turístico y la base SQLite FTS5 generada para que una réplica no tenga que reconstruir la guía desde cero; los modelos, secretos y el almacenamiento persistente de Qdrant siguen siendo locales.
 
 ## Arquitectura actual
 
@@ -107,14 +107,21 @@ el perfil Piper.
 
 ## RAG
 
-La implementación está en `backend/app/main.py`, `scripts/ingest.py` y `scripts/index_qdrant.py`. El snapshot no incluye `data/source`, `data/generated` ni la colección Qdrant. Para reconstruir:
+La implementación está en `backend/app/main.py`, `scripts/ingest.py` y `scripts/index_qdrant.py`. El repositorio incluye `data/source` y los artefactos reproducibles de `data/generated`:
 
-1. Colocá el corpus turístico en `data/source/Guia_Turistica_Lavalleja_Consolidada_v4(2).md`.
-2. Ejecutá `python scripts/ingest.py` para generar SQLite FTS5 y artefactos intermedios.
-3. Ejecutá `python scripts/index_qdrant.py` para crear la colección y cargar vectores.
+- `data/source/Guia_Turistica_Lavalleja_Consolidada_v4(2).md`: fuente de verdad de la guía, con 4.088 líneas y 243 fuentes.
+- `data/generated/giana.sqlite3`: SQLite con FTS5, entidades, contactos y catálogo usada directamente por Flask.
+- `data/generated/*.jsonl`, `aliases.json` y `manifest.json`: bloques, chunks, catálogo, FAQ, fuentes, aliases y hash del corpus.
 
-El corpus original, los pesos y la colección Qdrant deben transferirse o
-generarse por un canal separado y no deben versionarse.
+La colección Qdrant no se versiona porque es un índice binario/runtime. Para reconstruirla en otra máquina:
+
+1. Instalá el modelo de embeddings `ibm-granite/granite-embedding-97m-multilingual-r2` y las dependencias.
+2. Si se desea regenerar la base, ejecutá `python scripts/ingest.py`; debe coincidir el SHA256 de `data/generated/manifest.json`.
+3. Ejecutá `python scripts/index_qdrant.py` para crear `giana_granite_v2` y cargar los vectores en Qdrant.
+4. `scripts/start_production.ps1` y `.sh` realizan ese indexado automáticamente si Qdrant está vacío.
+
+Los modelos/pesos, las voces ONNX, los secretos y la colección Qdrant no se
+versionan. El corpus y los derivados pequeños sí forman parte de esta entrega.
 
 ## Arranque
 
@@ -152,4 +159,7 @@ docker compose up -d qdrant
 
 ## Estado del snapshot
 
-Este repositorio contiene código fuente, configuración, scripts, tests y documentación. Se excluyen intencionalmente secretos, `.env` reales, modelos/pesos, voces ONNX, corpus, datasets, índices Qdrant, SQLite poblada, caches, logs, traces, audios, builds, `node_modules` y virtualenvs.
+Este repositorio contiene código fuente, configuración, scripts, tests,
+documentación y la base de conocimiento curada. Se excluyen intencionalmente
+secretos, `.env` reales, modelos/pesos, voces ONNX, índices Qdrant, caches, logs,
+traces, audios, builds, `node_modules` y virtualenvs.
