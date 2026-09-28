@@ -14,6 +14,7 @@ from pathlib import Path
 import ctranslate2
 import numpy as np
 from faster_whisper import WhisperModel
+from faster_whisper.vad import VadOptions
 from loguru import logger
 from pipecat.frames.frames import ErrorFrame, Frame, TranscriptionFrame
 from pipecat.services.whisper.stt import WhisperSTTService
@@ -21,6 +22,7 @@ from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
 
 from voice.trace import trace_event
+from voice.input_quality import STTRejectedFrame, measure_audio, evaluate_audio, evaluate_transcription_quality
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL_PATH = ROOT / "models" / "whisper-large-v3-turbo"
@@ -37,6 +39,10 @@ def _setting(name: str, default: str) -> str:
     return os.getenv(name, default).strip()
 
 
+def _enabled(name: str, default: bool = True) -> bool:
+    return _setting(name, str(default)).lower() in {"1", "true", "yes", "on"}
+
+
 def whisper_config() -> dict:
     return {
         "provider": _setting("STT_PROVIDER", "whisper_turbo"),
@@ -49,7 +55,12 @@ def whisper_config() -> dict:
         "compute_type": _setting("STT_COMPUTE_TYPE", "int8_float16"),
         "beam_size": int(_setting("STT_BEAM_SIZE", "1")),
         "num_workers": int(_setting("STT_NUM_WORKERS", "1")),
-        "hotwords": _setting("STT_HOTWORDS", "Lavalleja Minas Cerro Arequita Villa Serrana Salto del Penitente Solís de Mataojo José Pedro Varela Mariscala Zapicán Pirarajá Parque Salus Giana"),
+        "hotwords": _setting("STT_HOTWORDS", "Lavalleja Minas Cerro Arequita Villa Serrana Salto del Penitente Solís de Mataojo José Pedro Varela Mariscala Zapicán Pirarajá Parque Salus Giana Gianna"),
+        "vad_filter": _enabled("STT_VAD_FILTER"),
+        "vad_threshold": float(_setting("STT_VAD_THRESHOLD", "0.50")),
+        "quality_gate": _enabled("STT_QUALITY_GATE_ENABLED"),
+        "max_no_speech_prob": float(_setting("STT_MAX_NO_SPEECH_PROB", "0.4")),
+        "min_avg_logprob": float(_setting("STT_MIN_AVG_LOGPROB", "-1.0")),
     }
 
 
@@ -123,29 +134,44 @@ class GianaWhisperTurboSTTService(WhisperSTTService):
             return
         cfg = self._giana_cfg
         started = time.perf_counter()
+        samples = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
+        evidence = measure_audio(samples)
+        audio_decision = evaluate_audio(evidence) if cfg["quality_gate"] else None
+        metrics = dict(audio_ms=round(evidence.audio_ms, 1), peak=round(evidence.peak, 5), rms=round(evidence.rms, 5), active_fraction=round(evidence.active_fraction, 3), active_ms=round(evidence.active_ms, 1))
+        trace_event("stt", "stt_audio_candidate", **metrics, denoise_enabled=_enabled("AUDIO_DENOISE_ENABLED"))
+        if audio_decision and not audio_decision.accepted:
+            trace_event("stt", "stt_audio_rejected", detail=audio_decision.reason, reason=audio_decision.reason, **metrics)
+            yield STTRejectedFrame(reason=audio_decision.reason)
+            return
         try:
             async with _INFERENCE_LOCK:
                 def transcribe_sync():
-                    samples = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
-                    # Silero can leave a short residual segment around a stop
-                    # event. Do not ask Whisper to invent text from digital
-                    # silence; this is an energy gate, not a duration rule.
-                    if samples.size == 0 or float(np.max(np.abs(samples))) < 0.003:
+                    if samples.size == 0 or evidence.peak < 0.003:
                         return [], None
                     segments, info = self._model.transcribe(
                         samples,
                         language=cfg["language"], task=cfg["task"], beam_size=cfg["beam_size"],
-                        temperature=0.0, condition_on_previous_text=False, vad_filter=False,
+                        temperature=0.0, condition_on_previous_text=False, vad_filter=cfg["vad_filter"],
+                        vad_parameters=VadOptions(threshold=cfg["vad_threshold"], min_speech_duration_ms=120, min_silence_duration_ms=350, speech_pad_ms=120),
                         word_timestamps=False, hotwords=cfg["hotwords"], no_speech_threshold=0.6,
                         compression_ratio_threshold=2.4, log_prob_threshold=-1.0,
                     )
                     # Iteration is part of CT2 inference and must remain in this
                     # worker, not resume on the event loop.
-                    return [(segment.text, segment.no_speech_prob) for segment in segments], info
+                    return [dict(text=segment.text, no_speech_prob=segment.no_speech_prob, avg_logprob=segment.avg_logprob, compression_ratio=segment.compression_ratio, duration_ms=round((segment.end-segment.start)*1000, 1)) for segment in segments], info
 
                 result, info = await asyncio.to_thread(transcribe_sync)
-            text = " ".join(text.strip() for text, no_speech in result if text.strip() and no_speech < 0.4).strip()
-            trace_event("stt", "whisper_transcription_complete", elapsed_ms=round((time.perf_counter() - started) * 1000, 2), detail=text, model=MODEL_ID, device="cuda", compute_type=cfg["compute_type"], audio_ms=round(len(audio) / 32, 2), segment_count=len(result))
+            decision = evaluate_transcription_quality(evidence, result, max_no_speech_prob=cfg["max_no_speech_prob"], min_avg_logprob=cfg["min_avg_logprob"]) if cfg["quality_gate"] else None
+            text = " ".join(item["text"].strip() for item in result if item["text"].strip() and item["no_speech_prob"] <= cfg["max_no_speech_prob"]).strip()
+            summary = dict(segment_count=len(result), no_speech_prob=round(max((item["no_speech_prob"] for item in result), default=1.0), 3), avg_logprob=round(min((item["avg_logprob"] for item in result), default=0.0), 3), compression_ratio=round(max((item["compression_ratio"] for item in result), default=0.0), 3), **metrics)
+            elapsed = round((time.perf_counter() - started) * 1000, 2)
+            if not text or (decision and not decision.accepted):
+                reason = decision.reason if decision and not decision.accepted else "vad_no_speech"
+                trace_event("stt", "stt_audio_rejected", elapsed_ms=elapsed, detail=reason, reason=reason, **summary)
+                yield STTRejectedFrame(reason=reason)
+                return
+            trace_event("stt", "stt_transcription_accepted", elapsed_ms=elapsed, detail=text, reason="accepted", **summary)
+            trace_event("stt", "whisper_transcription_complete", elapsed_ms=elapsed, detail=text, model=MODEL_ID, device="cuda", compute_type=cfg["compute_type"], audio_ms=round(len(audio) / 32, 2), segment_count=len(result))
             if text:
                 yield TranscriptionFrame(text, self._user_id, time_now_iso8601(), Language.ES)
         except Exception as exc:

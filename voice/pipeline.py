@@ -34,6 +34,8 @@ from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from voice.agent import GenerationController
 from voice.trace import trace_event
 from voice.stt import create_stt_service
+from voice.input_quality import STTRejectedFrame
+from voice.denoise import create_input_filter
 
 ROOT = Path(__file__).resolve().parents[1]
 VOICE_DIAGNOSTICS = os.getenv("GIANA_DIAGNOSTICS", "false").lower() == "true"
@@ -69,6 +71,7 @@ class TurnPhase(StrEnum):
     WAITING_TRANSCRIPT = "WAITING_TRANSCRIPT"
     COMPLETE_PENDING = "COMPLETE_PENDING"
     FINALIZED = "FINALIZED"
+    REJECTED = "REJECTED"
 
 
 class TurnState:
@@ -88,6 +91,7 @@ class TurnState:
         self.finalized = False
         self.backend_dispatched = False
         self.backend_dispatch_count = 0
+        self.input_rejected = False
         self.phase = TurnPhase.SPEECH
         self.session_id = ""
         self.generation_id: str | None = None
@@ -261,6 +265,11 @@ class GianaRAGProcessor(FrameProcessor):
         # Sección 13: generation assistant ACTIVA (despacho en curso).  El
         # barge-in cancela únicamente ésta, nunca la del turno que empieza.
         self._active_assistant_generation_id: str | None = None
+        # VAD can fire on a short noise burst. Stop current playback at once,
+        # but only cancel the backend generation after STT accepts speech.
+        self._pending_assistant_interruption: str | None = None
+        self._pre_interruption_generation = None
+        self._deferred_assistant_answer = None
         self.http_client = httpx.AsyncClient(base_url=self.backend_url, timeout=httpx.Timeout(60.0, connect=3.0, read=60.0))
 
     async def cleanup(self):
@@ -304,6 +313,41 @@ class GianaRAGProcessor(FrameProcessor):
         self._grace_task = None
         self._finalizing = False
 
+    async def _confirm_assistant_interruption(self, turn: TurnState):
+        generation_id = self._pending_assistant_interruption
+        if not generation_id:
+            return
+        self._pending_assistant_interruption = None
+        self._pre_interruption_generation = None
+        self._deferred_assistant_answer = None
+        if self._active_assistant_generation_id == generation_id:
+            await self.controller.interrupt()
+            self._active_assistant_generation_id = None
+            trace_event("turn", "generation_cancelled", session_id=turn.session_id, turn_id=turn.turn_id,
+                        generation_id=generation_id, detail="accepted user speech",
+                        cancelled_generation_id=generation_id, new_turn_id=turn.turn_id)
+
+    async def _restore_assistant_after_rejected_input(self, turn: TurnState):
+        generation_id = self._pending_assistant_interruption
+        previous = self._pre_interruption_generation
+        if not generation_id or self._active_assistant_generation_id != generation_id:
+            return
+        self._pending_assistant_interruption = None
+        self._pre_interruption_generation = None
+        if previous is not None:
+            self.controller.current = previous
+        trace_event("turn", "assistant_resumed_after_noise", session_id=turn.session_id,
+                    turn_id=turn.turn_id, generation_id=generation_id,
+                    detail="STT rejected provisional interruption")
+        deferred = self._deferred_assistant_answer
+        self._deferred_assistant_answer = None
+        if deferred and self.controller.is_current(generation_id):
+            text, generation, payload, started = deferred
+            task = asyncio.create_task(self._emit_assistant_answer(text, generation, payload, started))
+            self._tasks.add(task)
+            task.add_done_callback(self._task_done)
+            self.controller.task = task
+
     async def process_frame(self, frame, direction):
         # Keep Pipecat's system-frame lifecycle (StartFrame creates the
         # processor queue used for ordinary frames) before handling the RAG
@@ -333,9 +377,15 @@ class GianaRAGProcessor(FrameProcessor):
             # sí misma (bug previo: turn_started X → generation_cancelled X).
             cancelled_generation_id = self._active_assistant_generation_id
             if cancelled_generation_id:
-                await self.controller.interrupt()
-                self._active_assistant_generation_id = None
-                trace_event("turn", "generation_cancelled", session_id=generation.session_id, turn_id=generation.turn_id, generation_id=cancelled_generation_id, detail="barge-in/user start", cancelled_generation_id=cancelled_generation_id, new_turn_id=turn.turn_id if turn else "")
+                # Playback is stopped by forwarding InterruptionFrame. Keep
+                # the response task alive until STT distinguishes speech from
+                # noise, so false VAD starts cannot erase a valid answer.
+                self._pending_assistant_interruption = cancelled_generation_id
+                if self._pre_interruption_generation is None:
+                    self._pre_interruption_generation = self.controller.current
+                trace_event("turn", "assistant_interruption_pending_stt", session_id=generation.session_id,
+                            turn_id=generation.turn_id, generation_id=cancelled_generation_id,
+                            detail="audio stopped; awaiting accepted transcript or noise rejection")
             else:
                 trace_event("turn", "generation_cancel_skipped", session_id=generation.session_id, turn_id=generation.turn_id, generation_id=generation.generation_id, detail="no active assistant generation to cancel")
             await self.push_frame(frame, direction)
@@ -361,6 +411,7 @@ class GianaRAGProcessor(FrameProcessor):
                 # resetting this barrier a fast SmartTurn closes on old text
                 # while the second Whisper result is still in flight.
                 turn.transcript_ready = False
+                turn.input_rejected = False
                 turn.smart_turn_decision = None
                 turn.phase = TurnPhase.SPEECH
                 trace_event("turn", "speech_resumed", session_id=turn.session_id, turn_id=turn.turn_id, generation_id=turn.generation_id or "", detail="same semantic turn")
@@ -369,6 +420,9 @@ class GianaRAGProcessor(FrameProcessor):
                 # respuesta de este turno todavía NO existe (sección 12) — se
                 # crea recién al finalizar.
                 self._cancel_scheduled_tasks("new user turn")
+                if self._active_assistant_generation_id:
+                    self._pending_assistant_interruption = self._active_assistant_generation_id
+                    self._pre_interruption_generation = self.controller.current
                 generation = self.controller.start()
                 turn = TurnState(generation.turn_id)
                 turn.session_id = generation.session_id
@@ -386,6 +440,9 @@ class GianaRAGProcessor(FrameProcessor):
                 trace_event("turn", "turn_stopped_ignored", detail="no active turn or already finalized")
                 return
             turn.speech_active = False
+            if turn.input_rejected and not turn.transcript_segments:
+                await self._reject_empty_turn(turn, "stt_rejected")
+                return
             self.turn_state = "COMPLETE_PENDING"
             turn.phase = TurnPhase.ANALYZING_END
             trace_event("turn", "complete_pending", session_id=turn.session_id, turn_id=turn.turn_id, generation_id=turn.generation_id or "", detail=f"speech_active={turn.speech_active} smart_turn={turn.smart_turn_decision} transcript_ready={turn.transcript_ready}", smart_turn=turn.smart_turn_decision or "PENDING", transcript_ready=turn.transcript_ready)
@@ -416,6 +473,7 @@ class GianaRAGProcessor(FrameProcessor):
                 self.turn = turn
             trace_event("turn", "stt_segment_final", session_id=turn.session_id, turn_id=turn.turn_id, generation_id=turn.generation_id or "", detail=frame.text, finalized=getattr(frame, "finalized", None))
             if turn.transcript_arrived(frame.text):
+                await self._confirm_assistant_interruption(turn)
                 turn.transcript_ready = True
                 trace_event("turn", "transcript_buffer_updated", session_id=turn.session_id, turn_id=turn.turn_id, generation_id=turn.generation_id or "", detail=turn.text, transcript_segments=len(turn.transcript_segments))
                 record = self.turn_records.get(turn.turn_id)
@@ -426,7 +484,26 @@ class GianaRAGProcessor(FrameProcessor):
                 await self._notify_frontend("user_transcript_updated", {"session_id": turn.session_id, "turn_id": turn.turn_id, "text": turn.text})
                 await self.try_finalize_turn(turn, source="transcript_final")
             return
+        if isinstance(frame, STTRejectedFrame):
+            turn = self.turn
+            if turn and not turn.finalized and not turn.transcript_segments:
+                turn.input_rejected = True
+                trace_event("turn", "stt_input_rejected", session_id=turn.session_id, turn_id=turn.turn_id, generation_id=turn.generation_id or "", detail=frame.reason)
+                if not turn.speech_active:
+                    await self._reject_empty_turn(turn, frame.reason)
+            return
         await self.push_frame(frame, direction)
+
+    async def _reject_empty_turn(self, turn: TurnState, reason: str):
+        if turn is not self.turn or turn.finalized or turn.transcript_segments:
+            return
+        self._cancel_scheduled_tasks("noise rejected")
+        turn.finalized = True
+        turn.phase = TurnPhase.REJECTED
+        self.turn_state = "LISTENING"
+        trace_event("turn", "noise_turn_discarded", session_id=turn.session_id, turn_id=turn.turn_id, generation_id=turn.generation_id or "", detail=reason)
+        await self._notify_frontend("voice_input_rejected", {"session_id": turn.session_id, "turn_id": turn.turn_id})
+        await self._restore_assistant_after_rejected_input(turn)
 
     # ------------------------------------------------------------------
     # Sección 3: UNA SOLA FUNCIÓN DE DECISIÓN.
@@ -546,6 +623,11 @@ class GianaRAGProcessor(FrameProcessor):
                 raise RuntimeError(payload.get("error_code", f"backend HTTP {status}"))
             trace_event("voice", "backend_response_received", session_id=generation.session_id, turn_id=generation.turn_id, generation_id=generation_id, detail=f"HTTP {status}", elapsed_ms=elapsed)
             if not self.controller.is_current(generation_id) or payload.get("state") == "INTERRUPTED":
+                if self._pending_assistant_interruption == generation_id and payload.get("state") != "INTERRUPTED":
+                    self._deferred_assistant_answer = (text, generation, payload, started)
+                    trace_event("voice", "assistant_answer_deferred_for_stt", session_id=generation.session_id,
+                                turn_id=generation.turn_id, generation_id=generation_id,
+                                detail="waiting to distinguish speech from rejected noise")
                 return
             await self._emit_assistant_answer(text, generation, payload, started)
         except asyncio.CancelledError:
@@ -659,10 +741,25 @@ class TracedPiperTTSService(PiperHttpTTSService):
             raise
 
 
+def create_vad_analyzer():
+    params = VADParams(
+        confidence=float(os.getenv("VAD_CONFIDENCE", "0.60")),
+        start_secs=float(os.getenv("VAD_START_SECS", "0.064")),
+        stop_secs=float(os.getenv("VAD_STOP_SECS", "0.60")),
+        min_volume=float(os.getenv("VAD_MIN_VOLUME", "0.10")),
+    )
+    trace_event("audio", "vad_configured", detail=str(params))
+    return SileroVADAnalyzer(params=params)
+
+
+def create_vad_processor():
+    return VADProcessor(vad_analyzer=create_vad_analyzer())
+
+
 def build_smallwebrtc_pipeline(connection, backend_url=None, conversation_id=None):
     backend_url = backend_url or os.getenv("BACKEND_URL", "http://localhost:5000")
-    transport = SmallWebRTCTransport(connection, TransportParams(audio_in_enabled=True, audio_out_enabled=True, audio_in_sample_rate=16000, audio_out_sample_rate=16000, audio_out_channels=1))
-    vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(params=VADParams(confidence=0.6, start_secs=0.1, stop_secs=0.6, min_volume=0.2)))
+    transport = SmallWebRTCTransport(connection, TransportParams(audio_in_enabled=True, audio_out_enabled=True, audio_in_sample_rate=16000, audio_out_sample_rate=16000, audio_out_channels=1, audio_in_filter=create_input_filter()))
+    vad = create_vad_processor()
     stt = create_stt_service()
     smart_turn = TracedSmartTurnAnalyzer(cpu_count=1, params=SmartTurnParams(stop_secs=1.5))
     turn_manager = UserTurnProcessor(user_turn_strategies=UserTurnStrategies(start=[VADUserTurnStartStrategy()], stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=smart_turn, wait_for_transcript=False)]), user_turn_stop_timeout=USER_TURN_STOP_TIMEOUT_SECS)
@@ -677,8 +774,8 @@ def build_smallwebrtc_pipeline(connection, backend_url=None, conversation_id=Non
 
 def build_livekit_pipeline(url, token, room_name, backend_url=None):
     backend_url = backend_url or os.getenv("BACKEND_URL", "http://localhost:5000")
-    transport = LiveKitTransport(url=url, token=token, room_name=room_name, params=LiveKitParams(audio_in_enabled=True, audio_out_enabled=True, audio_in_sample_rate=16000, audio_out_sample_rate=16000, audio_out_channels=1))
-    vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(params=VADParams(confidence=0.6, start_secs=0.1, stop_secs=0.6, min_volume=0.2)))
+    transport = LiveKitTransport(url=url, token=token, room_name=room_name, params=LiveKitParams(audio_in_enabled=True, audio_out_enabled=True, audio_in_sample_rate=16000, audio_out_sample_rate=16000, audio_out_channels=1, audio_in_filter=create_input_filter()))
+    vad = create_vad_processor()
     stt = create_stt_service()
     smart_turn = TracedSmartTurnAnalyzer(cpu_count=1, params=SmartTurnParams(stop_secs=1.5))
     turn_manager = UserTurnProcessor(user_turn_strategies=UserTurnStrategies(start=[VADUserTurnStartStrategy()], stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=smart_turn, wait_for_transcript=False)]), user_turn_stop_timeout=USER_TURN_STOP_TIMEOUT_SECS)

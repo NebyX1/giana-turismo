@@ -14,6 +14,22 @@ describen la base que se conserva, no el total ampliado.
 
 Ejecutar el generador con **PowerShell 7 / pwsh**, no Windows PowerShell 5.
 
+## Subsuite de entrada de voz y ruido
+
+Antes de aprobar cambios en el micrófono, con Piper y los servicios locales arriba:
+
+```powershell
+.venv/Scripts/python.exe -m unittest discover -s tests/audio_noise -v
+.venv/Scripts/python.exe -m tests.audio_noise.evaluate_pipeline
+node tests/e2e/voice_noise.mjs
+node tests/e2e/mic_constraints.mjs
+$env:GIANA_E2E_MODE='voice-resilience'; node tests/e2e/conversation_audio.mjs
+$env:GIANA_DIAGNOSTICS='true'; .venv/Scripts/python.exe scripts/test_turn_race.py
+.venv/Scripts/python.exe scripts/test_conversation_regressions.py
+```
+
+`evaluate_pipeline` usa 10 WAV sintéticos congelados en `tests/audio_noise/fixtures/` (regenerables explícitamente con `python -m tests.audio_noise.generate_fixtures`), transmite PCM 16 kHz por RNNoise/Silero y verifica el STT CUDA. No almacena audio humano. `voice_noise.mjs` sustituye sólo la fuente del micrófono del navegador de prueba; usa SmallWebRTC/backend/Piper reales. `mic_constraints.mjs` utiliza el dispositivo falso de Chrome y comprueba los `getSettings()` reportados por la aplicación. Algunos navegadores/hardware ignoran AGC=false aunque `applyConstraints` resuelva: se reporta en `unsupported`, no se afirma que esté desactivado. Este conjunto no reemplaza la prueba física de silencio, teclado, golpes, ventilador, voz suave y barge-in durante TTS.
+
 ## Ejecutar
 
 Con los servicios levantados:

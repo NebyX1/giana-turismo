@@ -11,7 +11,10 @@ const session = fs.readFileSync(path.join(root, 'logs/test/CURRENT_SESSION.txt')
 const out = path.join(session, `browser-${Date.now()}`);
 fs.mkdirSync(out, { recursive: true });
 const mode = process.env.GIANA_E2E_MODE || 'conversation';
-const cases = mode === 'voice-context' ? [
+const cases = mode === 'voice-recap' ? [
+  ['Quiero saber qué eventos culturales van a haber en Lavalleja en las próximas semanas.', 'lavalleja'],
+  ['¿Qué me estabas diciendo antes?', 'antes'],
+] : mode === 'voice-context' ? [
   ['¿Y su teléfono?', 'telefono'],
   ['¿Y su dirección?', 'direccion'],
   ['Quiero comer vegano en Minas.', 'vegano'],
@@ -194,14 +197,15 @@ try {
       await page.evaluate(wav => window.__qa.play(wav), fixtures[index][part]);
     }
     await page.waitForFunction(offset => window.__qa.messages.slice(offset).some(m => m.type === 'server-message' && m.data?.event === 'assistant_response_finalized'), offset, { timeout: 90000 });
-    if(mode==='voice-resilience' && index===1){
+    if((mode==='voice-resilience' && index===1) || (mode==='voice-recap' && index===0)){
       await page.waitForFunction(offset=>window.__qa.messages.slice(offset).some(m=>m.type==='bot-started-speaking'),offset,{timeout:30000});
       await page.waitForTimeout(400);
       const events=await page.evaluate(offset=>window.__qa.messages.slice(offset),offset);
       const answer=events.find(m=>m.type==='server-message'&&m.data?.event==='assistant_response_finalized').data;
       expect(answer.text.length).toBeGreaterThan(150);
+      if(mode==='voice-recap') expect(norm(answer.text)).toContain('semana de lavalleja');
       expect(events.some(m=>m.type==='bot-stopped-speaking')).toBe(false);
-      results.push({turn:2,status:'PASS',test:'long answer is playing before deliberate interruption',generation_id:answer.generation_id,answer:answer.text});
+      results.push({turn:index+1,status:'PASS',test:'long answer is playing before deliberate interruption',generation_id:answer.generation_id,answer:answer.text});
       fs.writeFileSync(path.join(out,'interruption-target.json'),JSON.stringify({answer,events},null,2));
       continue;
     }
@@ -212,7 +216,7 @@ try {
       const spoken = events.filter(m => m.type === 'bot-tts-text').map(m => m.data.text).join(' ');
       const norm = s => s.replace(/\s+/g, ' ').trim();
       return answer && (interrupted ? norm(spoken).endsWith(norm(answer)) : norm(spoken) === norm(answer));
-    }, {offset,interrupted:mode==='voice-resilience'&&index===2}, { timeout: 90000 });
+    }, {offset,interrupted:(mode==='voice-resilience'&&index===2)||(mode==='voice-recap'&&index===1)}, { timeout: 90000 });
     await page.waitForFunction(offset => window.__qa.messages.slice(offset).some(m => m.type === 'bot-stopped-speaking'), offset, { timeout: 90000 });
     const messages = await page.evaluate(offset => window.__qa.messages.slice(offset), offset);
     const users = messages.filter(m => m.type === 'server-message' && m.data?.event === 'user_turn_finalized');
@@ -230,6 +234,12 @@ try {
       if(index===0 || index===4) expect(answer.route).toBe('CONVERSATION');
       if(index===2){expect(answer.route).toBe('CLOCK');expect(answer.text).toContain(answer.time_context.time);}
       if(index===3){expect(norm(answer.text)).toContain('jorgito');expect(norm(answer.text)).toContain('pololo');}
+    }
+    if(mode==='voice-recap'){
+      expect(answer.route).toBe('CONTEXT_RECAP');
+      expect(norm(answer.text)).toContain('semana de lavalleja');
+      expect(norm(answer.text)).not.toContain('en que te puedo ayudar');
+      expect(answer.web_invoked).not.toBe(true);
     }
     if (mode === 'deep-pause') expect(norm(answer.text)).toContain('don tadeo');
     if (mode === 'deep-quality') {
@@ -313,7 +323,7 @@ try {
       }
     }
     const playedText = messages.filter(m => m.type === 'bot-tts-text').map(m => m.data.text).join(' ');
-    if(mode==='voice-resilience'&&index===2) expect(norm(playedText)).toMatch(new RegExp(norm(answer.text).replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'$'));
+    if((mode==='voice-resilience'&&index===2)||(mode==='voice-recap'&&index===1)) expect(norm(playedText)).toMatch(new RegExp(norm(answer.text).replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'$'));
     else expect(norm(playedText), 'entire answer completed transport playout').toBe(norm(answer.text));
     expect(norm(user.text)).toContain(cases[index][1]);
     for (const keyword of cases[index][2] || []) expect(norm(user.text), 'both sides of the pause preserved').toContain(keyword);
@@ -325,8 +335,8 @@ try {
     expect(energyAfter.reduce((n, x) => n + x.energy, 0)).toBeGreaterThan(energyBefore.reduce((n, x) => n + x.energy, 0));
     const trace = fs.readFileSync(path.join(session, 'trace.jsonl'), 'utf8').split('\n').filter(s => s.trim()).map(s => JSON.parse(s.replace(/^\uFEFF/, '')));
     const segments = trace.filter(e => e.event === 'tts_segment_completed' && e.generation_id === answer.generation_id);
-    if(mode==='voice-resilience'&&index===2){
-      const target=results.find(r=>r.turn===2);
+    if((mode==='voice-resilience'&&index===2)||(mode==='voice-recap'&&index===1)){
+      const target=results.find(r=>r.turn===(mode==='voice-recap'?1:2));
       expect(trace.some(e=>e.event==='vad_speech_started'&&e.generation_id===target.generation_id),'speech started during old answer').toBe(true);
       expect(trace.some(e=>e.event==='interruption_received'&&e.session_id===answer.session_id&&e.turn_id===user.turn_id),'transport interruption received for replacement turn').toBe(true);
       const speechStart=messages.find(m=>m.type==='user-started-speaking')?.time;

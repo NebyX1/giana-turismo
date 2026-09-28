@@ -5,9 +5,46 @@ import { useConversationStore } from './store';
 import type { ConversationState } from './types';
 import { applyTurnMessage } from './voiceMessages';
 
+const micOption = (name: string, fallback: boolean) => {
+  const value = import.meta.env[name];
+  return value == null ? fallback : !['false', '0', 'off', 'no'].includes(String(value).toLowerCase());
+};
+const micConstraints = {
+  echoCancellation: micOption('VITE_MIC_ECHO_CANCELLATION', true),
+  noiseSuppression: micOption('VITE_MIC_NOISE_SUPPRESSION', true),
+  autoGainControl: micOption('VITE_MIC_AUTO_GAIN_CONTROL', false),
+};
+
 export const stateLabel: Record<ConversationState, string> = {
   IDLE: '', CONNECTING: 'Conectando…', LISTENING: 'Escuchando…', TRANSCRIBING: 'Procesando lo que dijiste…', WAITING_TRANSCRIPT: 'Procesando lo que dijiste…', RETRIEVING: 'Buscando en la guía de Lavalleja…', THINKING: 'Pensando…', WEB_SEARCHING: 'Buscando en la web…', SPEAKING: 'Gianna está hablando', INTERRUPTED: '', ERROR: 'No pude completar esa acción. Probá de nuevo.',
 };
+
+export function useWebSearchProgress() {
+  const sessionId = useConversationStore((s) => s.conversationId);
+  const generationId = useConversationStore((s) => s.currentGenerationId);
+  const voiceState = useConversationStore((s) => s.voiceState);
+  useEffect(() => {
+    if (!generationId || !['RETRIEVING', 'WEB_SEARCHING'].includes(voiceState)) return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const params = new URLSearchParams({ session_id: sessionId, generation_id: generationId });
+        const response = await fetch(`/api/turn-progress?${params}`, { cache: 'no-store' });
+        if (response.ok) {
+          const progress = await response.json() as { state?: string };
+          const current = useConversationStore.getState();
+          if (!cancelled && current.conversationId === sessionId && current.currentGenerationId === generationId
+            && current.voiceState === 'RETRIEVING'
+            && progress.state === 'WEB_SEARCHING') current.setVoiceState('WEB_SEARCHING');
+        }
+      } catch { /* Keep the normal activity status if a progress check fails. */ }
+      if (!cancelled) timer = window.setTimeout(poll, 350);
+    };
+    void poll();
+    return () => { cancelled = true; if (timer !== undefined) window.clearTimeout(timer); };
+  }, [sessionId, generationId, voiceState]);
+}
 
 export function useAutoScroll<T extends HTMLElement>(dependency: unknown) {
   const ref = useRef<T>(null);
@@ -62,6 +99,27 @@ export function useVoiceSession() {
         const audio = remoteAudioRef.current;
         const details = { track_id: track.id, readyState: track.readyState, muted: track.muted, enabled: track.enabled, kind: track.kind, participant: Boolean(participant) };
         trace('frontend_remote_track_started', JSON.stringify(details));
+        if (track.kind === 'audio' && participant?.local) {
+          void (async () => {
+            const unavailable: string[] = [];
+            try { await track.applyConstraints(micConstraints); }
+            catch {
+              // A browser/synthetic track may not support every property. Try
+              // each independently so missing AGC cannot prevent AEC.
+              for (const [name, value] of Object.entries(micConstraints)) {
+                try { await track.applyConstraints({ [name]: value }); }
+                catch { unavailable.push(name); }
+              }
+            }
+            const settings = track.getSettings();
+            for (const [name, requested] of Object.entries(micConstraints)) {
+              const applied = settings[name as keyof MediaTrackSettings];
+              if (applied !== requested && !unavailable.includes(name)) unavailable.push(name);
+            }
+            trace('frontend_mic_settings', JSON.stringify({ echoCancellation: settings.echoCancellation, noiseSuppression: settings.noiseSuppression, autoGainControl: settings.autoGainControl, sampleRate: settings.sampleRate, channelCount: settings.channelCount, deviceId: settings.deviceId, unsupported: unavailable }));
+          })().catch((error: unknown) => trace('frontend_mic_settings_unavailable', error instanceof Error ? error.message : String(error)));
+          return;
+        }
         // participant.local === true es el propio micrófono: reproducirlo genera eco.
         if (track.kind !== 'audio' || !audio || participant?.local) return;
         if (!remoteStreamRef.current || !remoteStreamRef.current.getTracks().some((item) => item.id === track.id)) {
@@ -93,6 +151,7 @@ export function useVoiceSession() {
         case 'backend_dispatch_started': store.setGenerationId(event.generation_id || null); setState('RETRIEVING'); break;
         case 'web_search_started': setState('WEB_SEARCHING'); break;
         case 'stt_transcript_missing': setState('ERROR'); trace('frontend_status_changed', 'STT_TRANSCRIPT_MISSING_AFTER_TURN_COMPLETE', 'error'); break;
+        case 'voice_input_rejected': store.setLiveTranscript(''); setState('LISTENING'); break;
       } },
       onBotLlmStarted: () => { setState('THINKING'); trace('frontend_status_changed', 'THINKING'); },
       onBotLlmText: (data) => { trace('frontend_assistant_text_received', data.text); },

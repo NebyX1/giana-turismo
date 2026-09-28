@@ -42,12 +42,14 @@ stages=[
 if not args.skip_voice: stages.append(('real-browser-voice',['node','tests/e2e/conversation_audio.mjs']))
 if not args.skip_voice: stages.append(('real-voice-interruption',['node','tests/e2e/conversation_audio.mjs']))
 if not args.skip_voice: stages.append(('real-voice-context',['node','tests/e2e/conversation_audio.mjs']))
+if not args.skip_voice: stages.append(('real-voice-recap',['node','tests/e2e/conversation_audio.mjs']))
 results=[]
 for name,cmd in stages:
     print(f'STAGE {name}',flush=True)
     env=dict(os.environ,GIANA_E2E_MODE='deep-quality',PYTHONUTF8='1')
     if name=='real-voice-interruption':env['GIANA_E2E_MODE']='voice-resilience'
     if name=='real-voice-context':env['GIANA_E2E_MODE']='voice-context'
+    if name=='real-voice-recap':env['GIANA_E2E_MODE']='voice-recap'
     if name not in {'real-http-matrix','real-browser-text','real-browser-voice','resilience'}:
         env['GIANA_ROUTER_MODE']='rules'
     started=time.time()

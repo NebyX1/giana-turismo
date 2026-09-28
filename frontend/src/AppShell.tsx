@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Dismiss16Regular } from '@fluentui/react-icons';
 import { Button } from '@fluentui/react-components';
-import { useVoiceSession } from './hooks';
+import { useVoiceSession, useWebSearchProgress } from './hooks';
 import { useConversationStore } from './store';
 import { Composer, ConversationView, DebugPanel, TopBar, WebConsentCard, WebSearchOverlay } from './components';
 import { stripCitationMarkers } from './presentation';
@@ -15,6 +15,7 @@ const looksLikeWebRequest = (text: string) => {
 };
 
 export function AppShell() {
+  useWebSearchProgress();
   const { toggle, disconnect } = useVoiceSession(); const consent = useConversationStore((s) => s.pendingWebConsent); const store = useConversationStore(); const [error, setError] = useState('');
   const reportError = (errorCode: string, message: string, turnId = '') => { const qaSessionId = new URLSearchParams(window.location.search).get('qa_session') || ''; void fetch('/api/debug/trace', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ component: 'frontend', event: 'frontend_error_displayed', source: 'human', qa_session_id: qaSessionId, session_id: store.conversationId, turn_id: turnId, generation_id: store.currentGenerationId || '', status: 'error', error_code: errorCode, detail: JSON.stringify({ error_code: errorCode, source_component: 'AppShell', message }) }) }).catch(() => undefined); };
   useEffect(() => {

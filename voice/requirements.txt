@@ -1,3 +1,8 @@
 pipecat-ai[moonshine,whisper,piper,webrtc,livekit,runner]==1.10.0
 faster-whisper==1.2.1
 ctranslate2==4.8.2
+pyrnnoise==0.4.3
+# pyrnnoise 0.4.3 calls audiolab Graph(rate=...), removed in 0.5.
+audiolab==0.4.9
+# audiolab 0.4.9 uses av.option, removed in av 17.1.
+av==17.0.0

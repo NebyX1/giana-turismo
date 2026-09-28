@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 import requests
 import torch
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request
+from flask import Flask, g, jsonify, request
 from qdrant_client import QdrantClient
 from sentence_transformers import CrossEncoder, SentenceTransformer
 from voice.trace import trace_event
@@ -30,6 +30,8 @@ from backend.app.semantic_router import select_tool
 from backend.app.runtime_config import CONFIG
 from backend.app.intent_router import pure_conversation
 from backend.app.presentation import strip_citation_markers
+from backend.app.conversation_memory import is_recap_request, recap_answer
+from backend.app.turn_progress import get_progress, set_progress
 try:
     from livekit.api import AccessToken, VideoGrants
 except ImportError:
@@ -131,6 +133,10 @@ BUILD_ID = backend_build_id()
 CONSENTS = {}
 ACTIVE_GENERATIONS = {}
 SESSION_HISTORY = {}
+# The latest user query is staged before the slow retrieval/LLM path starts.
+# If the user barges in while that path is running, its generation is correctly
+# discarded, but the question itself must remain recoverable for a reminder.
+UNANSWERED_QUESTIONS = {}
 ROUTER_MODE = os.getenv('GIANA_ROUTER_MODE', CONFIG['router_mode'])
 
 
@@ -193,6 +199,33 @@ def remember_turn(session_id, user, assistant, intent=None):
     if intent:
         history[-1]['intent']=intent
     del history[:-10]
+
+
+def is_answer_reminder(text):
+    q = plain(text)
+    return bool(re.search(
+        r'\bno me (?:respondiste|contestaste|has respondido|has contestado)\b'
+        r'|\b(?:la )?pregunta (?:que te hice|que hice|de antes|anterior)\b'
+        r'|\blo que te pregunt[eé] (?:antes|hace un rato)\b'
+        r'|\b(?:hace un rato|hace un momento)\b.*\b(?:pregunt|consulta|responder|contestar)\w*\b', q
+    ))
+
+
+def previous_substantive_question(session_id):
+    """Recover an interrupted question first, then the latest factual turn."""
+    pending = UNANSWERED_QUESTIONS.get(session_id)
+    if pending and pending.get('query'):
+        return pending['query']
+    history = SESSION_HISTORY.get(session_id, [])
+    ignored = {CONVERSATION, GIANA_META, CURRENT_TIME}
+    return next((turn['user'] for turn in reversed(history)
+                 if turn.get('user') and turn.get('intent', classify_intent(turn['user'])) not in ignored), None)
+
+
+def clear_unanswered_question(session_id, generation_id):
+    pending = UNANSWERED_QUESTIONS.get(session_id)
+    if pending and pending.get('generation_id') == generation_id:
+        UNANSWERED_QUESTIONS.pop(session_id, None)
 
 
 def lexical(query, limit=20):
@@ -474,6 +507,7 @@ def web_followup_response(query, retrieval_query, session_id, history, trace_con
     window = event_window(retrieval_query, snapshot) if is_event_query(retrieval_query) else None
     def emit(event, **fields):
         trace_event('backend', event, **trace_context, **fields)
+    set_progress(session_id, generation_id, 'WEB_SEARCHING')
     emit('web_search_started', detail=retrieval_query)
     if CONFIG.get('web_research_mode') == 'agent_tools':
         research = agentic_web_research(retrieval_query, window, snapshot,
@@ -538,6 +572,7 @@ def web_followup_response(query, retrieval_query, session_id, history, trace_con
     assessment = {**assessment, 'answer': answer}
     remember_turn(session_id, retrieval_query, answer)
     SESSION_HISTORY[session_id][-1].update(web_window=window, web_query=retrieval_query)
+    clear_unanswered_question(session_id, generation_id)
     emit('web_research_answered', detail=answer, sources_read=research['sources_read'])
     emit('api_response_finished', detail='HTTP 200 WEB_SEARCH assessed answer')
     return jsonify({**metadata(), 'answer': answer,
@@ -550,6 +585,25 @@ def web_followup_response(query, retrieval_query, session_id, history, trace_con
 def current_time():
     response = jsonify(clock_snapshot())
     response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@app.get('/api/turn-progress')
+def turn_progress():
+    session_id = request.args.get('session_id', '')
+    generation_id = request.args.get('generation_id', '')
+    if not 1 <= len(session_id) <= 128 or not 1 <= len(generation_id) <= 128:
+        return jsonify({'error': 'session_id and generation_id required'}), 400
+    response = jsonify({'state': get_progress(session_id, generation_id), 'generation_id': generation_id})
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@app.after_request
+def finish_turn_progress(response):
+    turn = getattr(g, 'progress_turn', None)
+    if turn:
+        set_progress(*turn, 'DONE')
     return response
 
 
@@ -636,8 +690,27 @@ def ask_text():
     session_id = body.get('conversation_id') or body.get("session_id", "default")
     turn_id = body.get("turn_id", f"text-{uuid.uuid4().hex[:8]}")
     generation_id = body.get("generation_id") or str(uuid.uuid4())
+    g.progress_turn = (session_id, generation_id)
+    set_progress(session_id, generation_id, 'RETRIEVING')
     trace_context = {"session_id": body.get('session_id',session_id), "turn_id": turn_id, "generation_id": generation_id, "source": body.get("source", "probe"), "qa_session_id": body.get("qa_session_id", "")}
     trace_event("backend", "api_ask_received", **trace_context, detail=query if query == raw_query else f"{query} (original: {raw_query})")
+    received_query = query
+    reminder = is_answer_reminder(query)
+    recap_requested = is_recap_request(query)
+    # An answer may have been cancelled before it was saved. In that case a
+    # request to repeat it must retry the pending question, not recite an older
+    # answer from the same session.
+    pending_answer = bool(UNANSWERED_QUESTIONS.get(session_id))
+    recovered_question = previous_substantive_question(session_id) if reminder or (recap_requested and pending_answer) else None
+    if recovered_question:
+        query = normalize_transcript(recovered_question)
+        recap_requested = False
+        trace_event("backend", "unanswered_question_recovered", **trace_context,
+                    detail=f"reminder={received_query}; recovered={query}")
+    # Stage user intent immediately. A new independent turn supersedes the
+    # old pending query; a reminder instead adopts the recovered question.
+    if query:
+        UNANSWERED_QUESTIONS[session_id] = {"query": query, "generation_id": generation_id}
     ACTIVE_GENERATIONS[session_id] = generation_id
     retrieval_query = standalone_query(session_id, query)
     history = list(SESSION_HISTORY.get(session_id, []))
@@ -646,8 +719,11 @@ def ask_text():
     trace_event("backend", "standalone_query_resolved", **trace_context, detail=retrieval_query, context_turns=len(history))
     intent_started = time.perf_counter()
     intent = classify_intent(query)
-    decision = {'mode':'offline_conversation' if pure_conversation(query) else 'rules','tool':None}
-    if ROUTER_MODE != 'rules' and not pure_conversation(query):
+    decision = {'mode':'context_recap' if recap_requested else 'offline_conversation' if pure_conversation(query) else 'rules',
+                'tool':'conversation' if recap_requested else None}
+    if recap_requested:
+        intent = CONVERSATION
+    if ROUTER_MODE != 'rules' and not pure_conversation(query) and not recovered_question and not recap_requested:
         decision = select_tool(query, history, model=CONFIG['router_model'], mode=ROUTER_MODE)
         if decision['error']:
             # One bounded alternate, not an unbounded agent loop.
@@ -668,20 +744,25 @@ def ask_text():
         intent = CURRENT_INFO
     intent_ms = now_ms(intent_started)
     rag_invoked = intent == TOURISM_RAG
-    route = "CLOCK" if intent == CURRENT_TIME else "PERSONA" if intent == GIANA_META else "CONVERSATION" if intent == CONVERSATION else "OUT_OF_SCOPE" if intent == OUT_OF_SCOPE else "WEB_SEARCH" if intent in {WEB_FOLLOWUP, CURRENT_INFO} else "HYBRID_RERANK"
+    route = "CLOCK" if intent == CURRENT_TIME else "PERSONA" if intent == GIANA_META else "CONTEXT_RECAP" if recap_requested else "CONVERSATION" if intent == CONVERSATION else "OUT_OF_SCOPE" if intent == OUT_OF_SCOPE else "WEB_SEARCH" if intent in {WEB_FOLLOWUP, CURRENT_INFO} else "HYBRID_RERANK"
     trace_event("backend", "intent_classified", **trace_context, detail=f"intent={intent} route={route} rag_invoked={str(rag_invoked).lower()}", intent=intent, route=route, rag_invoked=rag_invoked, elapsed_ms=intent_ms)
     if intent == CURRENT_TIME:
         answer = clock_answer(snapshot)
         remember_turn(session_id, query, answer, intent)
+        clear_unanswered_question(session_id, generation_id)
         return jsonify({'answer': answer, 'state': 'ANSWERABLE', 'route': route, 'intent': intent, 'rag_invoked': False, 'web_invoked': False, 'evidence': [], 'generation_id': generation_id, 'time_context': snapshot})
     if intent in {GIANA_META, CONVERSATION, OUT_OF_SCOPE}:
         if intent == CONVERSATION:
-            kind = conversation_kind(query)
-            variant = sum(1 for item in history if kind and conversation_kind(item.get('user', '')) == kind)
-            answer = conversation_answer(query, variant)
+            if recap_requested:
+                answer = recap_answer(history)
+            else:
+                kind = conversation_kind(query)
+                variant = sum(1 for item in history if kind and conversation_kind(item.get('user', '')) == kind)
+                answer = conversation_answer(query, variant)
         else:
             answer = persona_answer(query) if intent == GIANA_META else out_of_scope_answer(query)
         remember_turn(session_id, query, answer, intent)
+        clear_unanswered_question(session_id, generation_id)
         trace_event("backend", "rag_skipped", **trace_context, detail=f"intent={intent}", intent=intent, route=route, rag_invoked=False)
         trace_event("backend", "assistant_text_ready", **trace_context, detail=f"{route.lower()} answer_length={len(answer)}", intent=intent, route=route, rag_invoked=False)
         return jsonify({"answer": answer, "state": "ANSWERABLE", "route": route, "intent": intent, "rag_invoked": False, "generation_id": generation_id, "evidence": [], "normalized_query": query, "debug": {"timings": {"intent_ms": intent_ms, "rag_ms": 0, "total_ms": now_ms(intent_started)}}})
@@ -735,6 +816,7 @@ def ask_text():
     state = 'ANSWERABLE' if assessment['sufficient'] else 'NO_EVIDENCE'
     response = {"answer": answer, "state": state, "route": route, "intent": intent, "rag_invoked": True, "web_invoked": False, "evidence_sufficient": assessment['sufficient'], "evidence_assessment": assessment, "llm_invoked": bool(evidence), "generation_id": generation_id, "evidence": [{k: x.get(k) for k in ["title", "start_line", "end_line", "source_refs", "text"]} for x in evidence]}
     remember_turn(session_id, query, answer)
+    clear_unanswered_question(session_id, generation_id)
     response["standalone_query"] = retrieval_query
     response["normalized_query"] = query
     if DIAGNOSTICS_ENABLED:

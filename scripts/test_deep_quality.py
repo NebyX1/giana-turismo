@@ -9,6 +9,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from backend.app import main as app
 from backend.app.answer_quality import assessed_answer
+from backend.app.conversation_memory import is_recap_request
 from backend.app.retrieval_quality import catalog_candidates, parent_evidence, retrieval_terms
 from backend.app.intent_router import classify_intent, CONVERSATION, CURRENT_INFO, WEB_FOLLOWUP, OUT_OF_SCOPE, TOURISM_RAG
 from backend.app.temporal import clock_snapshot, event_window
@@ -27,6 +28,7 @@ class DeepQuality(unittest.TestCase):
         config_patch.start();self.addCleanup(config_patch.stop)
         app.SESSION_HISTORY.clear()
         app.ACTIVE_GENERATIONS.clear()
+        app.UNANSWERED_QUESTIONS.clear()
         self.client = app.app.test_client()
 
     def ask(self, question, sid='deep-unit'):
@@ -156,6 +158,111 @@ class DeepQuality(unittest.TestCase):
             r=self.ask('Donde comer en Minas')
         self.assertEqual(r['state'],'INTERRUPTED')
         self.assertFalse(app.SESSION_HISTORY.get('deep-unit'))
+        self.assertEqual(app.UNANSWERED_QUESTIONS['deep-unit']['query'], 'Donde comer en Minas')
+
+    def test_reminder_recovers_and_answers_interrupted_web_question(self):
+        question = '¿Qué eventos culturales hay en los próximos días en Minas?'
+
+        def superseded_answer(*a, **k):
+            app.ACTIVE_GENERATIONS['deep-unit'] = 'new-generation'
+            return reply(True, 'Hay un evento confirmado [1].')
+
+        with patch.object(app, 'clock_snapshot', return_value=NOW), \
+             patch.object(app, 'web_search', return_value=({'results': [WEB]}, None)), \
+             patch.object(app, 'web_fetch', return_value=({'content': WEB['content']}, None)), \
+             patch.object(app, 'llm_answer', side_effect=superseded_answer):
+            interrupted = self.ask(question)
+        self.assertEqual(interrupted['state'], 'INTERRUPTED')
+        self.assertFalse(app.SESSION_HISTORY.get('deep-unit'))
+
+        reminder = '¿Y Gianna no me respondiste la pregunta que hice hace un rato?'
+        self.assertTrue(app.is_answer_reminder(reminder))
+        with patch.object(app, 'clock_snapshot', return_value=NOW), \
+             patch.object(app, 'web_search', return_value=({'results': [WEB]}, None)) as search, \
+             patch.object(app, 'web_fetch', return_value=({'content': WEB['content']}, None)), \
+             patch.object(app, 'llm_answer', return_value=reply(True, 'Sí: encontré un evento cultural en Minas.')):
+            recovered = self.ask(reminder)
+
+        self.assertEqual(recovered['route'], 'WEB_SEARCH')
+        self.assertEqual(recovered['state'], 'ANSWERABLE')
+        self.assertTrue(recovered['web_invoked'])
+        self.assertTrue(any('minas' in call.args[0].lower() for call in search.call_args_list))
+        self.assertIn('evento cultural', recovered['answer'].lower())
+        self.assertFalse(app.UNANSWERED_QUESTIONS.get('deep-unit'))
+
+    def test_reminder_skips_social_turns_and_recovers_latest_completed_question(self):
+        question = '¿Qué eventos culturales hay en los próximos días en Minas?'
+        app.remember_turn('deep-unit', 'Hola Gianna, ¿cómo estás?', 'Estoy bien.', CONVERSATION)
+        app.remember_turn('deep-unit', 'Gracias por preguntar.', 'A las órdenes.', CONVERSATION)
+        app.remember_turn('deep-unit', question, 'La consulta web fue interrumpida.', WEB_FOLLOWUP)
+
+        self.assertTrue(app.is_answer_reminder('¿Y Gianna no me respondiste a la pregunta que hice hace un rato?'))
+        self.assertEqual(app.previous_substantive_question('deep-unit'), question)
+        with patch.object(app, 'clock_snapshot', return_value=NOW), \
+             patch.object(app, 'web_search', return_value=({'results': [WEB]}, None)) as search, \
+             patch.object(app, 'web_fetch', return_value=({'content': WEB['content']}, None)), \
+             patch.object(app, 'llm_answer', return_value=reply(True, 'Encontré un evento cultural en Minas.')):
+            recovered = self.ask('¿Y Gianna no me respondiste a la pregunta que hice hace un rato?')
+        self.assertEqual(recovered['route'], 'WEB_SEARCH')
+        self.assertTrue(recovered['web_invoked'])
+        self.assertEqual(search.call_count, 3)
+
+    def test_interrupted_speech_recap_uses_prior_answer_not_generic_greeting(self):
+        previous = ('Sí, hay varias propuestas lindas en Lavalleja. La Semana de Lavalleja 2026 '
+                    'tiene su programación en el Parque Rodó de Minas del miércoles 7 al domingo '
+                    '11 de octubre, con entrada gratuita. Después, la Noche de los Fogones se '
+                    'hace en el Cerro Artigas el 17 y 18 de octubre. Además hay una tarde de poesía.')
+        app.remember_turn('deep-unit', 'Quiero saber qué eventos culturales van a haber en Lavalleja '
+                          'en las próximas semanas.', previous, CURRENT_INFO)
+        exact_transcript = 'Cortar un poco ociana ¿Qué me estabas diciendo antes?'
+        with patch.object(app, 'select_tool', side_effect=AssertionError('no semantic router for recap')), \
+             patch.object(app, 'retrieve', side_effect=AssertionError('no RAG for recap')), \
+             patch.object(app, 'web_search', side_effect=AssertionError('no web for recap')):
+            result = self.ask(exact_transcript)
+        self.assertEqual(result['route'], 'CONTEXT_RECAP')
+        self.assertEqual(result['state'], 'ANSWERABLE')
+        self.assertFalse(result['rag_invoked'])
+        self.assertIn('Semana de Lavalleja', result['answer'])
+        self.assertIn('Noche de los Fogones', result['answer'])
+        self.assertNotIn('¿en qué te puedo ayudar?', result['answer'])
+        self.assertEqual(len(app.SESSION_HISTORY['deep-unit']), 2)
+
+    def test_recap_paraphrases_and_social_turn_do_not_hide_factual_answer(self):
+        app.remember_turn('deep-unit', 'Eventos culturales en Minas',
+                          'Hay actividades en Parque Rodó este sábado.', CURRENT_INFO)
+        app.remember_turn('deep-unit', 'Gracias', 'A las órdenes.', CONVERSATION)
+        variants = ('¿Qué me estabas diciendo antes?', '¿Qué dijiste recién?',
+                    'Podés repetir tu respuesta anterior?', 'Contame de nuevo lo que dijiste',
+                    'Retomá lo que venías contando', '¿De qué estábamos hablando?')
+        for text in variants:
+            with self.subTest(text=text), patch.object(app, 'select_tool', side_effect=AssertionError('no router')):
+                result = self.ask(text)
+            self.assertEqual(result['route'], 'CONTEXT_RECAP')
+            self.assertIn('Parque Rodó', result['answer'])
+        self.assertFalse(is_recap_request('¿Hay algo para hacer antes de la Semana de Lavalleja?'))
+        self.assertFalse(is_recap_request('¿Qué pregunté antes?'))
+
+    def test_recap_without_prior_answer_does_not_invent_memory_or_cross_sessions(self):
+        app.remember_turn('other-session', 'Eventos en Minas',
+                          'Hay actividades en Parque Rodó.', CURRENT_INFO)
+        with patch.object(app, 'select_tool', side_effect=AssertionError('no router')):
+            result = self.ask('¿Qué me estabas diciendo antes?', sid='new-session')
+        self.assertEqual(result['route'], 'CONTEXT_RECAP')
+        self.assertIn('No tengo una respuesta anterior', result['answer'])
+        self.assertNotIn('Parque Rodó', result['answer'])
+
+    def test_recap_retries_pending_question_instead_of_older_history(self):
+        app.remember_turn('deep-unit', 'Qué visitar en Minas', 'Podés visitar el Cerro Artigas.', TOURISM_RAG)
+        app.UNANSWERED_QUESTIONS['deep-unit'] = {'query': 'Qué eventos culturales hay en Minas',
+                                                 'generation_id': 'interrupted'}
+        with patch.object(app, 'clock_snapshot', return_value=NOW), \
+             patch.object(app, 'web_search', return_value=({'results': [WEB]}, None)), \
+             patch.object(app, 'web_fetch', return_value=({'content': WEB['content']}, None)), \
+             patch.object(app, 'llm_answer', return_value=reply(True, 'Encontré un evento en Minas.')):
+            result = self.ask('¿Qué me estabas diciendo antes?')
+        self.assertEqual(result['route'], 'WEB_SEARCH')
+        self.assertIn('evento en Minas', result['answer'])
+        self.assertNotIn('Cerro Artigas', result['answer'])
 
     def test_session_isolation(self):
         app.remember_turn('a','Eventos esta semana en Minas','a')

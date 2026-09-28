@@ -1,6 +1,6 @@
 # Arquitectura actual
 
-Estado verificado contra el código y la instalación Windows 11 del repositorio el 20/09/2026. Giana V2 ya no es un flujo lineal de navegador a Flask: separa la interfaz, el transporte de voz, el procesamiento de turnos, el backend de conocimiento y los servicios de infraestructura.
+Estado verificado contra el código y la instalación Windows 11 del repositorio el 28/09/2026. Gianna V2 ya no es un flujo lineal de navegador a Flask: separa la interfaz, el transporte de voz, el procesamiento de turnos, el backend de conocimiento y los servicios de infraestructura.
 
 ## Flujo general
 
@@ -52,11 +52,14 @@ Estados relevantes: `CONNECTING`, `LISTENING`, `WAITING_TRANSCRIPT`, `RETRIEVING
 La implementación está en `voice/bot.py`, `voice/pipeline.py`, `voice/stt.py` y `voice/tts/`.
 
 ```text
-WebRTC audio in
+Browser mic (AEC on, noise suppression on, AGC off by default)
+	-> WebRTC input 16 kHz mono PCM
+	-> RNNoise (CPU; 16 -> 48 -> 16 kHz in Pipecat, optional)
 	-> Silero VAD (CPU)
 	-> STT configurable:
-			 whisper_turbo (predeterminado, faster-whisper/CTranslate2, CUDA int8_float16)
+			 whisper_turbo (predeterminado, inner Silero VAD + faster-whisper/CTranslate2, CUDA int8_float16)
 			 moonshine (rollback explícito, CPU)
+	-> acoustic/STT quality gate (rechazos sin transcript ni backend)
 	-> UserTurnProcessor + LocalSmartTurnAnalyzerV3 (CPU)
 	-> TurnState / try_finalize_turn()
 	-> GianaRAGProcessor
@@ -67,6 +70,14 @@ WebRTC audio in
 ```
 
 La barrera `TurnState` permite que SmartTurn y el transcript final lleguen en cualquier orden. Sólo `try_finalize_turn()` puede despachar el turno; el watchdog y el timeout de gracia son mecanismos de diagnóstico y recuperación, no rutas paralelas de finalización. El `generation_id` permite cancelar una respuesta antigua durante un barge-in sin cancelar la generación nueva del usuario.
+
+### Ajuste de entrada de voz
+
+`frontend/.env.local` permite configurar `VITE_MIC_ECHO_CANCELLATION`, `VITE_MIC_NOISE_SUPPRESSION` y `VITE_MIC_AUTO_GAIN_CONTROL`. Se aplican con `MediaStreamTrack.applyConstraints()` sobre la pista local administrada por Pipecat; Chrome puede ignorar una constraint y `getSettings()` se registra sólo en `?debug=1`. El micrófono permanece abierto durante el TTS para conservar barge-in.
+
+`AUDIO_DENOISE_ENABLED=false` permite A/B sin RNNoise. Con RNNoise activado, una inicialización fallida es un error explícito, no un bypass silencioso. `VAD_CONFIDENCE`, `VAD_START_SECS`, `VAD_STOP_SECS` y `VAD_MIN_VOLUME` gobiernan el VAD de turno compartido por SmallWebRTC y LiveKit. Aumentar confianza/inicio/volumen reduce activaciones falsas, pero también pierde palabras breves o voz suave; por eso los defaults se calibraron con frases de una palabra y no se adoptó 0.78/0.25/0.50. `STT_VAD_FILTER` y `STT_VAD_THRESHOLD` gobiernan el segundo VAD dentro de faster-whisper; `STT_QUALITY_GATE_ENABLED`, `STT_MAX_NO_SPEECH_PROB` y `STT_MIN_AVG_LOGPROB` gobiernan la evidencia final. Los rechazos normales no generan mensajes ni TTS y no disparan el watchdog de transcript faltante. El panel `?debug=1` muestra su último motivo y estadísticas; nunca se graba audio humano por defecto.
+
+Dependencias RNNoise validadas en Windows: `pyrnnoise==0.4.3`, `audiolab==0.4.9`, `av==17.0.0`. La pareja `pyrnnoise 0.4.3` / `audiolab 0.5.2` importa pero falla en `Graph(rate=...)`; `audiolab 0.4.9` necesita `av.option`, ausente en `av 17.1.0`.
 
 El adaptador `voice/tts/kokoro_service.py` implementa Kokoro 82M con CUDA, voz `ef_dora` y conversión de 24 kHz a 16 kHz. Fue probado localmente en Windows, pero es una integración seleccionable: el perfil operativo del launcher actual fuerza Piper, por eso Piper es el TTS activo de esta instalación.
 
