@@ -719,11 +719,12 @@ def ask_text():
     trace_event("backend", "standalone_query_resolved", **trace_context, detail=retrieval_query, context_turns=len(history))
     intent_started = time.perf_counter()
     intent = classify_intent(query)
-    decision = {'mode':'context_recap' if recap_requested else 'offline_conversation' if pure_conversation(query) else 'rules',
+    local_conversation = pure_conversation(query) and conversation_kind(query) != 'scope'
+    decision = {'mode':'context_recap' if recap_requested else 'offline_conversation' if local_conversation else 'rules',
                 'tool':'conversation' if recap_requested else None}
     if recap_requested:
         intent = CONVERSATION
-    if ROUTER_MODE != 'rules' and not pure_conversation(query) and not recovered_question and not recap_requested:
+    if ROUTER_MODE != 'rules' and not local_conversation and not recovered_question and not recap_requested:
         decision = select_tool(query, history, model=CONFIG['router_model'], mode=ROUTER_MODE)
         if decision['error']:
             # One bounded alternate, not an unbounded agent loop.
@@ -760,12 +761,14 @@ def ask_text():
                 variant = sum(1 for item in history if kind and conversation_kind(item.get('user', '')) == kind)
                 answer = conversation_answer(query, variant)
         else:
-            answer = persona_answer(query) if intent == GIANA_META else out_of_scope_answer(query)
+            answer = persona_answer(query) if intent == GIANA_META else decision.get('answer') or out_of_scope_answer(query)
+        if ACTIVE_GENERATIONS.get(session_id) != generation_id:
+            return jsonify({'answer':None,'state':'INTERRUPTED','generation_id':generation_id,'evidence':[]})
         remember_turn(session_id, query, answer, intent)
         clear_unanswered_question(session_id, generation_id)
         trace_event("backend", "rag_skipped", **trace_context, detail=f"intent={intent}", intent=intent, route=route, rag_invoked=False)
         trace_event("backend", "assistant_text_ready", **trace_context, detail=f"{route.lower()} answer_length={len(answer)}", intent=intent, route=route, rag_invoked=False)
-        return jsonify({"answer": answer, "state": "ANSWERABLE", "route": route, "intent": intent, "rag_invoked": False, "generation_id": generation_id, "evidence": [], "normalized_query": query, "debug": {"timings": {"intent_ms": intent_ms, "rag_ms": 0, "total_ms": now_ms(intent_started)}}})
+        return jsonify({"answer": answer, "state": "ANSWERABLE", "route": route, "intent": intent, "rag_invoked": False, "web_invoked": False, "generation_id": generation_id, "evidence": [], "normalized_query": query, "debug": {"timings": {"intent_ms": intent_ms, "rag_ms": 0, "total_ms": now_ms(intent_started)}}})
     if intent in {WEB_FOLLOWUP, CURRENT_INFO}:
         return web_followup_response(query, retrieval_query, session_id, history, trace_context, generation_id, snapshot, intent)
     timings = {"structured_ms": None, "fts_ms": None, "embedding_ms": None, "qdrant_ms": None, "rrf_ms": None, "rerank_ms": None, "evidence_ms": None, "llm_connect_ms": None, "llm_first_token_ms": None, "llm_total_ms": None}

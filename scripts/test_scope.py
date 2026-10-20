@@ -2,9 +2,10 @@
 import json
 import sys
 import urllib.request
+import uuid
 
 BASE = "http://127.0.0.1:5000/api/ask-text"
-SESSION = "scope-test"
+SESSION = "scope-test-" + uuid.uuid4().hex[:10]
 failures = []
 
 
@@ -47,6 +48,37 @@ check("hoy_is_not_current_info", r["intent"] == "TOURISM_RAG" and r["state"] == 
 # 6. Saludo con nombre mal transcrito.
 r = ask("Hola Jana, ¿podés escuchar lo que estoy hablando?")
 check("greeting_alias", r["route"] == "CONVERSATION", f"route={r['route']} answer={r['answer']}")
+
+# 7. El límite temático no permite inventar una ubicación fuera de Lavalleja.
+r = ask("Me perdí y no sé cómo llegar a casa.")
+lost_answer = r['answer']
+check("personal_request_has_contextual_scope_reply",
+      r['route'] == 'OUT_OF_SCOPE' and 'lavalleja' in lost_answer.lower()
+      and 'fuera de lavalleja' not in lost_answer.lower()
+      and any(word in lost_answer.lower() for word in ('casa', 'domicilio', 'hogar', 'ubica'))
+      and not r.get('rag_invoked') and not r.get('web_invoked'),
+      f"route={r['route']} answer={lost_answer}")
+
+# 8. La insistencia recibe una explicación redactada con el historial reciente.
+r = ask("Dale, por favor, necesito que me digas cómo volver a mi casa.")
+check("scope_reply_uses_followup_context",
+      r['route'] == 'OUT_OF_SCOPE' and 'lavalleja' in r['answer'].lower()
+      and r['answer'] != lost_answer and not r.get('rag_invoked') and not r.get('web_invoked'),
+      f"route={r['route']} answer={r['answer']}")
+
+# 9. Otra temática debe generar otra respuesta, sin proporcionar código.
+r = ask("Escribime un programa en Python para sumar números.")
+check("scope_reply_adapts_to_programming",
+      r['route'] == 'OUT_OF_SCOPE' and 'lavalleja' in r['answer'].lower()
+      and r['answer'] != lost_answer and any(word in r['answer'].lower() for word in ('program', 'python', 'código'))
+      and not r.get('rag_invoked') and not r.get('web_invoked'),
+      f"route={r['route']} answer={r['answer']}")
+
+# 10. Después de rechazar pedidos personales, vuelve a responder turismo local.
+r = ask("Mejor recomendame dónde comer asado en la ciudad de Minas.")
+check("tourism_recovers_after_scope_replies",
+      r['route'] != 'OUT_OF_SCOPE' and r['state'] == 'ANSWERABLE' and 'jorgito' in r['answer'].lower(),
+      f"route={r['route']} answer={r['answer']}")
 
 print()
 print("SCOPE_TEST_FAIL: " + ", ".join(failures) if failures else "SCOPE_TEST_PASS")

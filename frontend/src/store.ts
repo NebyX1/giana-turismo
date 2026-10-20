@@ -30,13 +30,13 @@ type ConversationStore = {
 };
 
 const id = () => `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-const greeting = (): ConversationMessage => ({ id: id(), role: 'assistant', content: 'Hola, soy Gianna, la asistente turística de Lavalleja.\n\nPodés preguntarme por lugares, actividades, gastronomía, alojamiento y el Geoparque Manantiales Serranos. También podés tocar el micrófono y hablar conmigo.', timestamp: new Date().toISOString(), local: true, pending: false });
 const migrateAssistantName = (messages: ConversationMessage[] | undefined) => messages?.map((message) => message.role === 'assistant'
   ? { ...message, content: message.content.replace(/\bGiana\b/g, 'Gianna').replace(/\bGIANA\b/g, 'GIANNA') }
   : message);
+const removeLocalGreeting = (messages: ConversationMessage[] | undefined) => migrateAssistantName(messages?.filter((message) => !message.local)) ?? [];
 
 export const useConversationStore = create<ConversationStore>()(persist((set) => ({
-  messages: [greeting()], conversationId: id(), voiceSessionId: null, voiceState: 'IDLE', connectionState: 'disconnected', currentGenerationId: null, pendingWebConsent: null, audioLevel: 0, liveTranscript: '',
+  messages: [], conversationId: id(), voiceSessionId: null, voiceState: 'IDLE', connectionState: 'disconnected', currentGenerationId: null, pendingWebConsent: null, audioLevel: 0, liveTranscript: '',
   addUserMessage: (content) => { const messageId = id(); set((s) => ({ messages: [...s.messages, { id: messageId, role: 'user', content, timestamp: new Date().toISOString() }] })); return messageId; },
   upsertVoiceMessage: (messageId, role, content, sources) => set((s) => ({ messages: s.messages.some(m => m.id === messageId)
     ? s.messages.map(m => m.id === messageId ? { ...m, content, sources: sources ?? m.sources, pending: false } : m)
@@ -47,5 +47,5 @@ export const useConversationStore = create<ConversationStore>()(persist((set) =>
   setVoiceState: (voiceState) => set({ voiceState }), setConnectionState: (connectionState) => set({ connectionState }), setGenerationId: (currentGenerationId) => set({ currentGenerationId }),
   setVoiceSessionId: (voiceSessionId) => set({ voiceSessionId }),
   setWebConsent: (pendingWebConsent) => set({ pendingWebConsent }), setAudioLevel: (audioLevel) => set({ audioLevel }), setLiveTranscript: (liveTranscript) => set({ liveTranscript }),
-  clearConversation: () => set({ messages: [greeting()], conversationId: id(), voiceState: 'IDLE', pendingWebConsent: null, currentGenerationId: null, liveTranscript: '' }),
-}), { name: 'giana-conversation-v1', version: 2, migrate: (persisted) => { const state = persisted as { messages?: ConversationMessage[]; conversationId?: string }; return { ...state, messages: migrateAssistantName(state.messages) }; }, storage: createJSONStorage(() => sessionStorage), partialize: (s) => ({ messages: s.messages, conversationId: s.conversationId }) }));
+  clearConversation: () => set({ messages: [], conversationId: id(), voiceState: 'IDLE', pendingWebConsent: null, currentGenerationId: null, liveTranscript: '' }),
+}), { name: 'giana-conversation-v1', version: 3, migrate: (persisted) => { const state = persisted as { messages?: ConversationMessage[]; conversationId?: string }; return { ...state, messages: removeLocalGreeting(state.messages) }; }, storage: createJSONStorage(() => sessionStorage), partialize: (s) => ({ messages: s.messages, conversationId: s.conversationId }) }));

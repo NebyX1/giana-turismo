@@ -88,11 +88,14 @@ El adaptador `voice/tts/kokoro_service.py` implementa Kokoro 82M con CUDA, voz `
 - conversación pura: respuesta local sin red, índice ni LLM;
 - reloj: hora real de Uruguay;
 - persona: identidad y misión de Gianna;
-- fuera de alcance: respuesta territorial controlada;
+- fuera de alcance: respuesta breve redactada por el selector según la pregunta y el historial, explicando su especialidad en turismo de Lavalleja;
 - conocimiento: RAG híbrido local;
 - información actual o búsqueda explícita: investigación web con consentimiento o fallback permitido.
 
 `backend/app/semantic_router.py` puede seleccionar una herramienta acotada con el modelo configurado en `backend/app/runtime_config.json`: `conversation`, `knowledge`, `web`, `clock`, `persona` u `out_of_scope`. La ejecución no es un bucle de agente abierto: valida la herramienta, limita argumentos y usa un fallback acotado.
+
+`out_of_scope` incluye un argumento `answer` que el modelo redacta en esa misma llamada. No agrega una generación ni accede a RAG o web; distingue el límite temático del geográfico sin inferir la ubicación del usuario. Si falta la redacción o es inválida, conserva la ruta fuera de alcance y utiliza una explicación local de respaldo.
+Los pedidos sociales para cambiar a un tema ajeno al turismo también pasan por el selector para recibir esa redacción contextual. Saludos, presencia/audio, bienestar y límites ante agresiones conservan sus respuestas locales.
 
 La configuración cloud efectiva es `deepseek-v4.1-flash:cloud` como selector
 semántico y modelo primario de respuesta, con `gemma4:31b-cloud` como fallback.

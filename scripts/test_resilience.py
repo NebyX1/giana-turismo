@@ -18,6 +18,7 @@ EVIDENCE=[{'title':'Parrilla','text':'Don Jorgito, Minas','source_refs':[]}]
 class Resilience(unittest.TestCase):
     def setUp(self):
         app.SESSION_HISTORY.clear(); app.ACTIVE_GENERATIONS.clear()
+        app.UNANSWERED_QUESTIONS.clear()
         self.client=app.app.test_client()
 
     def test_greeting_compositions_and_factual_suffixes(self):
@@ -40,6 +41,61 @@ class Resilience(unittest.TestCase):
         with patch.object(app,'ROUTER_MODE','tools'),patch.object(app,'select_tool',return_value={'tool':'conversation','error':None}),patch.object(app,'retrieve',side_effect=AssertionError('no retrieval')):
             r=self.client.post('/api/ask-text',json={'question':'Me estás entendiendo mal'})
         self.assertEqual(r.json['route'],'CONVERSATION')
+
+    def test_scope_tool_returns_model_wording_with_context_without_retrieval(self):
+        answer = 'Lamento que te hayas perdido. No conozco tu domicilio; puedo asesorarte sobre turismo en Lavalleja.'
+        app.remember_turn('scope-unit', 'Hola', 'Sí, te escucho.', CONVERSATION)
+        with patch.object(app, 'ROUTER_MODE', 'tools'), \
+             patch('backend.app.semantic_router.requests.post') as post, \
+             patch.object(app, 'retrieve', side_effect=AssertionError('out-of-scope must not use RAG')), \
+             patch.object(app, 'web_search', side_effect=AssertionError('out-of-scope must not use web')):
+            post.return_value.json.return_value = {'message': {'tool_calls': [
+                {'function': {'name': 'out_of_scope', 'arguments': {'answer': answer}}}]}}
+            response = self.client.post('/api/ask-text', json={
+                'question': 'Me perdí y no sé cómo llegar a casa.', 'session_id': 'scope-unit'})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json['route'], 'OUT_OF_SCOPE')
+        self.assertEqual(response.json['answer'], answer)
+        self.assertFalse(response.json['rag_invoked'])
+        self.assertFalse(response.json['web_invoked'])
+        self.assertEqual(post.call_count, 1)
+        messages = post.call_args.kwargs['json']['messages']
+        self.assertEqual(messages[-2]['content'], 'Sí, te escucho.')
+        self.assertEqual(messages[-1]['content'], 'Me perdí y no sé cómo llegar a casa.')
+
+    def test_scope_missing_or_invalid_wording_keeps_scope_route_and_safe_fallback(self):
+        for args in ({}, {'answer': ''}, {'answer': 'Eso queda fuera de Lavalleja.'},
+                     {'answer': 42}, {'answer': 'x' * 700}):
+            with self.subTest(args=str(args)[:60]), patch.object(app, 'ROUTER_MODE', 'tools'), \
+                 patch('backend.app.semantic_router.requests.post') as post, \
+                 patch.object(app, 'retrieve', side_effect=AssertionError('invalid wording must not trigger RAG')):
+                post.return_value.json.return_value = {'message': {'tool_calls': [
+                    {'function': {'name': 'out_of_scope', 'arguments': args}}]}}
+                response = self.client.post('/api/ask-text', json={
+                    'question': 'Me perdí y no sé cómo llegar a casa.', 'session_id': 'scope-invalid'})
+            self.assertEqual(response.json['route'], 'OUT_OF_SCOPE')
+            self.assertIn('turismo en Lavalleja', response.json['answer'])
+            self.assertNotIn('fuera de Lavalleja', response.json['answer'])
+            self.assertEqual(post.call_count, 1)
+
+    def test_json_scope_tool_supports_generated_response(self):
+        answer = 'No puedo escribir tu programa: mi especialidad es el turismo en Lavalleja.'
+        with patch('backend.app.semantic_router.requests.post') as post:
+            post.return_value.json.return_value = {'message': {'content': json.dumps({
+                'tool': 'out_of_scope', 'answer': answer})}}
+            result = select_tool('Escribime un programa', model='test', mode='json')
+        self.assertIsNone(result['error'])
+        self.assertEqual(result['answer'], answer)
+
+    def test_social_scope_request_reaches_model_instead_of_local_template(self):
+        answer = 'Para el humor no soy la indicada; puedo ayudarte con turismo en Lavalleja.'
+        with patch.object(app, 'ROUTER_MODE', 'tools'), patch.object(app, 'select_tool',
+                return_value={'tool': 'out_of_scope', 'answer': answer, 'error': None}) as router, \
+             patch.object(app, 'retrieve', side_effect=AssertionError('no retrieval for jokes')):
+            response = self.client.post('/api/ask-text', json={'question': 'Contame un chiste'})
+        router.assert_called_once()
+        self.assertEqual(response.json['route'], 'OUT_OF_SCOPE')
+        self.assertEqual(response.json['answer'], answer)
 
     def test_format_retry_once_uses_original_evidence(self):
         with patch.object(app,'llm_answer',side_effect=[('broken',None),(GOOD,None)]) as gen:

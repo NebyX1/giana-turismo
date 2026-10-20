@@ -330,7 +330,7 @@ try {
     await expect(page.locator('.user-row .message-content').last()).toHaveText(user.text);
     await expect(page.locator('.assistant-row .message-content').last()).toHaveText(answer.text);
     await expect(page.locator('.user-row')).toHaveCount(index + 1 + countOffset);
-    await expect(page.locator('.assistant-row')).toHaveCount(index + 2 + countOffset);
+    await expect(page.locator('.assistant-row')).toHaveCount(index + 1 + countOffset);
     const energyAfter = await page.evaluate(() => window.__qa.stats());
     expect(energyAfter.reduce((n, x) => n + x.energy, 0)).toBeGreaterThan(energyBefore.reduce((n, x) => n + x.energy, 0));
     const trace = fs.readFileSync(path.join(session, 'trace.jsonl'), 'utf8').split('\n').filter(s => s.trim()).map(s => JSON.parse(s.replace(/^\uFEFF/, '')));

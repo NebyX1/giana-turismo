@@ -19,7 +19,7 @@ try{
     await expect(page.locator('.user-row')).toHaveCount(0);
     const response=page.waitForResponse(r=>r.url().endsWith('/api/ask-text'));
     release(); await response; await page.waitForTimeout(300);
-    await expect(page.locator('.assistant-row')).toHaveCount(1);
+    await expect(page.locator('.assistant-row')).toHaveCount(0);
     await expect(page.locator('.inline-error')).toHaveCount(0);
     await expect(page.locator('.consent-card')).toHaveCount(0);
     expect(await page.locator('body').innerText()).not.toContain('OLD_');

@@ -232,4 +232,4 @@ def out_of_scope_answer(text: str) -> str:
     place = next((p for p in FOREIGN_PLACES if re.search(r"\b" + re.escape(p) + r"\b", q)), None)
     if place:
         return f"Sobre {place.title()} no puedo ayudarte: soy la asistente turística de Lavalleja. Si querés, te cuento qué hacer en Minas, Villa Serrana o el Cerro Arequita."
-    return "Eso queda fuera de Lavalleja, que es mi especialidad. ¿Querés que te recomiende algo del departamento?"
+    return "No puedo ayudarte con ese pedido: mi especialidad es el turismo en Lavalleja. Puedo orientarte sobre paseos, gastronomía y alojamiento en el departamento."

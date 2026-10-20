@@ -50,6 +50,8 @@
   {"id":"dog_penitente_stt","question":"Puedo llevar un perro al penitente.","rag":true,"web":false,"all":["correa"],"evidence":["correa"]},
   {"id":"social_wellbeing","question":"Hola Giana, ¿cómo estás?","route":"CONVERSATION","rag":false,"web":false,"all":["estoy bien","turismo en lavalleja"]},
   {"id":"social_personal","question":"¿Tenés novio?","route":"CONVERSATION","rag":false,"web":false,"all":["asistente virtual turistica","turismo en lavalleja"]},
-  {"id":"social_scope","question":"Contame un chiste","route":"CONVERSATION","rag":false,"web":false,"all":["especialidad","turismo en lavalleja"]},
+  {"id":"social_scope","question":"Contame un chiste","route":"OUT_OF_SCOPE","rag":false,"web":false,"all":["lavalleja"],"any":["turismo","turistica"]},
+  {"id":"personal_directions_scope","question":"Me perdí y no sé cómo llegar a casa.","route":"OUT_OF_SCOPE","rag":false,"web":false,"all":["lavalleja"],"any":["turismo","turistica"],"regex":["casa|domicilio|hogar|ubica"],"absent":["fuera de lavalleja"]},
+  {"id":"programming_scope","question":"Escribime un programa en Python para sumar números.","route":"OUT_OF_SCOPE","rag":false,"web":false,"all":["lavalleja"],"any":["turismo","turistica"],"regex":["program|python|codigo"]},
   {"id":"social_abuse","question":"¿Sos estúpida?","route":"CONVERSATION","rag":false,"web":false,"all":["no puedo responder","insultos o agresiones"]}
 ]

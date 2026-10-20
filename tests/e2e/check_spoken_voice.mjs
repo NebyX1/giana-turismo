@@ -25,7 +25,7 @@ try {
   await page.getByRole('button', { name: 'Activar micrófono' }).click();
   await page.waitForFunction(() =>
     document.querySelectorAll('.user-row .message-content').length > 0 &&
-    [...document.querySelectorAll('.assistant-row .message-content')].slice(1)
+    [...document.querySelectorAll('.assistant-row .message-content')]
       .some(element => element.textContent.trim().length > 0), null, { timeout: 60000 });
   console.log('USER:', await page.locator('.user-row .message-content').allTextContents());
   console.log('ASSISTANT:', await page.locator('.assistant-row .message-content').allTextContents());
