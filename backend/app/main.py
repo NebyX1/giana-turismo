@@ -1,3 +1,4 @@
+import atexit
 import json
 import os
 import re
@@ -10,13 +11,15 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
-import torch
 from dotenv import load_dotenv
-from flask import Flask, g, jsonify, request
+from flask import Flask, g, jsonify, request, send_from_directory
 from qdrant_client import QdrantClient
-from sentence_transformers import CrossEncoder, SentenceTransformer
-from voice.trace import trace_event
-from backend.app.intent_router import CONVERSATION, CURRENT_INFO, CURRENT_TIME, GIANA_META, OUT_OF_SCOPE, TOURISM_RAG, WEB_FOLLOWUP, classify_intent, conversation_answer, conversation_kind, normalize_transcript, out_of_scope_answer
+from backend.app.trace import trace_event, TRACE_PATH
+from backend.app.cpu_models import ModelManager
+from backend.app.model_policy import ROOT, EMBED_MODEL, RERANK_MODEL, COLLECTION, QDRANT_PATH
+from backend.app.vector_index import index_is_current
+from backend.app.ollama_connection import base_url, chat_headers, configured as ollama_configured
+from backend.app.intent_router import CONVERSATION, CURRENT_INFO, CURRENT_TIME, GIANA_META, OUT_OF_SCOPE, TOURISM_RAG, WEB_FOLLOWUP, classify_intent, conversation_answer, conversation_kind, normalize_query, out_of_scope_answer
 from backend.app.temporal import clock_snapshot, clock_answer, clock_context, has_relative_time, is_event_query, event_window, explicit_dates
 from backend.app.persona import persona_answer
 from backend.app.web_research import research_web, research_instruction
@@ -32,88 +35,15 @@ from backend.app.intent_router import pure_conversation
 from backend.app.presentation import strip_citation_markers
 from backend.app.conversation_memory import is_recap_request, recap_answer
 from backend.app.turn_progress import get_progress, set_progress
-try:
-    from livekit.api import AccessToken, VideoGrants
-except ImportError:
-    AccessToken = VideoGrants = None
-
-ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(ROOT / ".env")
 DB = ROOT / "data/generated/giana.sqlite3"
-QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333").replace("qdrant:6333", "localhost:6333")
-COLLECTION = os.getenv("QDRANT_COLLECTION", "giana_granite_v2")
-EMBED_MODEL = os.getenv("EMBEDDING_MODEL", "ibm-granite/granite-embedding-97m-multilingual-r2")
-RERANK_MODEL = os.getenv("RERANKER_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
-GPU_LOCK = threading.Lock()
-QDRANT = QdrantClient(url=QDRANT_URL)
-
-
-class ModelManager:
-    """Owns the single CUDA model pair and makes startup/warmup explicit."""
-
-    def __init__(self):
-        self.embedder = None
-        self.reranker = None
-        self.loaded = False
-        self.warmed = False
-        self.load_ms = None
-        self.warmup_ms = None
-
-    def load(self):
-        if self.loaded:
-            return
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA requerida por M1; no se permite fallback silencioso")
-        started = time.perf_counter()
-        dtype = torch.float16
-        self.embedder = SentenceTransformer(EMBED_MODEL, device="cuda", model_kwargs={"torch_dtype": dtype})
-        self.reranker = CrossEncoder(RERANK_MODEL, device="cuda", model_kwargs={"torch_dtype": dtype})
-        self.embedder.eval()
-        self.reranker.model.eval()
-        self.loaded = True
-        self.load_ms = round((time.perf_counter() - started) * 1000, 2)
-
-    def warmup(self):
-        self.load()
-        if self.warmed:
-            return
-        started = time.perf_counter()
-        with torch.inference_mode():
-            self.embedder.encode("warmup", normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False)
-            self.reranker.predict([["warmup", "warmup"]])
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        self.warmed = True
-        self.warmup_ms = round((time.perf_counter() - started) * 1000, 2)
-
-    def embed(self, query):
-        self.load()
-        with GPU_LOCK, torch.inference_mode():
-            return self.embedder.encode(query, normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False).tolist()
-
-    def rerank(self, pairs):
-        self.load()
-        with GPU_LOCK, torch.inference_mode():
-            return self.reranker.predict(pairs)
-
-    def status(self):
-        return {
-            "loaded": self.loaded,
-            "warmed": self.warmed,
-            "embedding_model": EMBED_MODEL,
-            "reranker_model": RERANK_MODEL,
-            "device": "cuda" if self.loaded else None,
-            "dtype": "float16" if self.loaded else None,
-            "load_ms": self.load_ms,
-            "warmup_ms": self.warmup_ms,
-        }
-
-
+QDRANT = QdrantClient(path=str(QDRANT_PATH), force_disable_check_same_thread=True)
+atexit.register(QDRANT.close)
 MODELS = ModelManager()
 DIAGNOSTICS_ENABLED = os.getenv("GIANA_DIAGNOSTICS", "false").lower() == "true"
 COUNTERS = {name: 0 for name in (
     "granite_encode_count", "reranker_predict_count", "qdrant_query_count", "fts_query_count",
-    "rag_query_count", "llm_request_count", "moonshine_final_transcript_count", "piper_synthesis_count",
+    "rag_query_count", "llm_request_count",
     "web_search_count", "web_fetch_count",
 )}
 COUNTER_LOCK = threading.Lock()
@@ -128,7 +58,7 @@ def count(name):
 def now_ms(started):
     return round((time.perf_counter() - started) * 1000, 2)
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder=str(ROOT / 'frontend/dist/assets'), static_url_path='/assets')
 BUILD_ID = backend_build_id()
 CONSENTS = {}
 ACTIVE_GENERATIONS = {}
@@ -333,8 +263,7 @@ LLM_SESSION = requests.Session()
 
 def llm_answer(query, evidence, timings=None, trace_context=None, context=None, retrieval_query=None, time_context=None, answer_contract=None, model_override=None):
     timings = timings if timings is not None else {}
-    key = os.getenv("OLLAMA_API_KEY", "")
-    if not key:
+    if not ollama_configured():
         return None, "LLM_UNAVAILABLE"
     package = "\n\n".join(f"[{i+1}] {x['title']} (URL: {x.get('url', '')}; origen: {x.get('content_origin', 'guía local')}; fuentes {x.get('source_refs', [])})\n{x['text']}" for i, x in enumerate(evidence))
     context_text = "\n".join(f"Usuario: {x['user']}\nGianna: {x['assistant']}" for x in (context or [])[-4:])
@@ -350,15 +279,14 @@ def llm_answer(query, evidence, timings=None, trace_context=None, context=None, 
         "Salto del Penitente, Parque Salus, Geoparque Manantiales Serranos y alrededores). Si una parte de la evidencia habla de un lugar "
         "fuera de Lavalleja (otra ciudad, otro país, cadenas internacionales), IGNORALA por completo y decí que no tenés ese dato para Lavalleja. "
         "Nunca recomiendes ni describas lugares fuera del departamento. Si el usuario nombra un lugar que no es de Lavalleja, aclaralo con amabilidad "
-        "y ofrecé alternativas dentro de Lavalleja. Si el nombre que usa el usuario parece una transcripción imperfecta de un lugar de la evidencia "
-        "(por ejemplo 'ser varequita' por Cerro Arequita), asumí que se refiere a ese lugar y respondé sobre él sin señalar el error."
+        "y ofrecé alternativas dentro de Lavalleja."
     )
-    prompt = f"""{scope}\nRespondé en español rioplatense usando solamente la evidencia. No inventes datos. Si falta algo, decilo. Para conversación por voz, respondé de forma concisa: normalmente entre 1 y 4 frases. Ampliá sólo si el usuario lo pide. {freshness}\nPregunta actual: {query}\nConsulta de recuperación: {retrieval_query or query}\nCONTEXTO REAL RECIENTE:\n{context_text or '(sin contexto previo)'}\n\nEVIDENCIA:\n{package}"""
+    prompt = f"""{scope}\nRespondé en español rioplatense usando solamente la evidencia. No inventes datos. Si falta algo, decilo. Respondé de forma concisa: normalmente entre 1 y 4 frases. Ampliá sólo si el usuario lo pide. {freshness}\nPregunta actual: {query}\nConsulta de recuperación: {retrieval_query or query}\nCONTEXTO REAL RECIENTE:\n{context_text or '(sin contexto previo)'}\n\nEVIDENCIA:\n{package}"""
     prompt += "\nRespetá la localidad solicitada: no sustituyas Minas ciudad por un paseo rural. Una parrilla catalogada permite recomendar el rubro, sin asegurar el corte, stock ni apertura de hoy. Respondé en texto plano, sin asteriscos ni Markdown."
     if answer_contract:
         prompt += '\nCONTRATO DE SALIDA DEL SISTEMA (fuera de la evidencia):\n' + answer_contract
-    base = os.getenv("OLLAMA_BASE_URL", "https://ollama.com").rstrip("/")
-    headers = {"Authorization": f"Bearer {key}"}
+    base = base_url()
+    headers = chat_headers()
 
     def run_model(model, read_timeout, event_name):
         count("llm_request_count")
@@ -460,7 +388,7 @@ def web_provider_request(endpoint, payload, timeout, error_code):
             retry_after = response.headers.get('Retry-After') if response is not None else None
             try: delay = max(0.75,float(retry_after)) if retry_after is not None else 0.75
             except (ValueError,TypeError): return None,error_code
-            # Do not hammer a throttled provider or leave a voice turn waiting
+            # Do not hammer a throttled provider or leave a chat request waiting
             # through a long quota reset. Such limits remain explicit errors.
             if delay > 2: return None,error_code
             time.sleep(delay)
@@ -607,32 +535,33 @@ def finish_turn_progress(response):
     return response
 
 
+@app.get('/')
+def frontend():
+    return send_from_directory(ROOT / 'frontend/dist', 'index.html')
+
+
+@app.get('/api/health')
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "embedding_model": EMBED_MODEL, "reranker_model": RERANK_MODEL, "cuda": True, "collection": COLLECTION})
+    return jsonify({"status": "ok", "embedding_model": EMBED_MODEL, "reranker_model": RERANK_MODEL, "device": "cpu", "backend": "onnxruntime", "collection": COLLECTION})
 
 
+@app.get('/api/ready')
 @app.get("/ready")
 def ready():
     collection_ready = False
     try:
-        collection_ready = QDRANT.collection_exists(COLLECTION)
+        collection_ready = index_is_current(QDRANT)
     except Exception:
         pass
     is_ready = MODELS.loaded and MODELS.warmed and collection_ready
-    return jsonify({"status": "ready" if is_ready else "not_ready", "build_id": BUILD_ID, "runtime": {**CONFIG,'router_mode':ROUTER_MODE}, "qdrant_ready": collection_ready, "models_loaded": MODELS.loaded, "models_warmed": MODELS.warmed, "llm_configured": bool(os.getenv("OLLAMA_API_KEY"))}), (200 if is_ready else 503)
+    return jsonify({"status": "ready" if is_ready else "not_ready", "build_id": BUILD_ID, "runtime": {**CONFIG,'router_mode':ROUTER_MODE}, "qdrant_ready": collection_ready, "models_loaded": MODELS.loaded, "models_warmed": MODELS.warmed, "llm_configured": ollama_configured()}), (200 if is_ready else 503)
 
 
 @app.get("/api/diagnostics")
 def diagnostics():
     with COUNTER_LOCK:
         counters = dict(COUNTERS)
-    voice_counters_path = ROOT / "run" / "voice_counters.json"
-    if voice_counters_path.exists():
-        try:
-            counters.update(json.loads(voice_counters_path.read_text(encoding="utf-8")))
-        except (OSError, json.JSONDecodeError):
-            pass
     return jsonify({"enabled": DIAGNOSTICS_ENABLED, "counters": counters, "models": MODELS.status()})
 
 
@@ -650,7 +579,7 @@ def debug_trace_event():
 def debug_last_turn():
     if not DIAGNOSTICS_ENABLED:
         return jsonify({"error": "diagnostics disabled"}), 404
-    trace_path = ROOT / "logs" / "voice_trace.jsonl"
+    trace_path = TRACE_PATH
     events = []
     session_filter = request.args.get("session_id", "")
     if trace_path.exists():
@@ -685,8 +614,8 @@ def ask_text():
             return jsonify({'error':field+' must be a nonempty string up to 128 characters'}),400
     raw_query=raw_query.strip()
     if not raw_query: return jsonify({"error": "question is required"}), 400
-    # Los topónimos mal transcritos se corrigen antes de clasificar, recuperar y responder.
-    query = normalize_transcript(raw_query)
+    # Los alias de topónimos se normalizan antes de clasificar, recuperar y responder.
+    query = normalize_query(raw_query)
     session_id = body.get('conversation_id') or body.get("session_id", "default")
     turn_id = body.get("turn_id", f"text-{uuid.uuid4().hex[:8]}")
     generation_id = body.get("generation_id") or str(uuid.uuid4())
@@ -703,7 +632,7 @@ def ask_text():
     pending_answer = bool(UNANSWERED_QUESTIONS.get(session_id))
     recovered_question = previous_substantive_question(session_id) if reminder or (recap_requested and pending_answer) else None
     if recovered_question:
-        query = normalize_transcript(recovered_question)
+        query = normalize_query(recovered_question)
         recap_requested = False
         trace_event("backend", "unanswered_question_recovered", **trace_context,
                     detail=f"reminder={received_query}; recovered={query}")
@@ -859,18 +788,10 @@ def fetch_web():
     return jsonify({"source": "web", "ephemeral": True, "timestamp": time.time(), "result": data})
 
 
-@app.post("/api/livekit/token")
-def livekit_token():
-    if AccessToken is None or not os.getenv("LIVEKIT_API_KEY") or not os.getenv("LIVEKIT_API_SECRET"):
-        return jsonify({"error_code": "LIVEKIT_CONFIG_MISSING"}), 503
-    body = request.get_json(silent=True) or {}
-    room = body.get("room", "giana")
-    identity = body.get("identity", f"guest-{uuid.uuid4().hex[:8]}")
-    token = AccessToken(os.getenv("LIVEKIT_API_KEY"), os.getenv("LIVEKIT_API_SECRET")).with_identity(identity).with_name("Gianna guest").with_grants(VideoGrants(room_join=True, room=room)).to_jwt()
-    return jsonify({"url": os.getenv("LIVEKIT_URL", ""), "room": room, "identity": identity, "token": token})
-
-
 if __name__ == "__main__":
+    from waitress import serve
+    from backend.app.vector_index import ensure_index
+    ensure_index(QDRANT, MODELS)
     MODELS.load()
     MODELS.warmup()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False, use_reloader=False)
+    serve(app, host='127.0.0.1', port=int(os.getenv('PORT', '5000')), threads=4)

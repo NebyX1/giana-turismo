@@ -3,7 +3,7 @@ import {chromium,expect} from '@playwright/test';
 const browser=await chromium.launch({channel:'chrome',headless:true});
 const page=await browser.newPage();
 try{
-  await page.goto('http://localhost:5173');
+  await page.goto(process.env.GIANA_BASE_URL || 'http://127.0.0.1:5000');
   for(const outcome of ['success','failure','consent']){
     let release;
     const blocked=new Promise(resolve=>{release=resolve;});
@@ -17,8 +17,7 @@ try{
     await request;
     await page.getByRole('button',{name:'Nueva conversación'}).click();
     await expect(page.locator('.user-row')).toHaveCount(0);
-    const response=page.waitForResponse(r=>r.url().endsWith('/api/ask-text'));
-    release(); await response; await page.waitForTimeout(300);
+    release(); await page.waitForTimeout(300);
     await expect(page.locator('.assistant-row')).toHaveCount(0);
     await expect(page.locator('.inline-error')).toHaveCount(0);
     await expect(page.locator('.consent-card')).toHaveCount(0);

@@ -11,6 +11,7 @@ import unicodedata
 from urllib.parse import urljoin, urlparse
 
 import requests
+from backend.app.ollama_connection import base_url, chat_headers
 from bs4 import BeautifulSoup
 from ddgs import DDGS
 
@@ -104,7 +105,7 @@ def search_ddgs(query: str, max_results=8):
         if cached and now-cached[0]<_SEARCH_CACHE_TTL_SECONDS:
             return {'results':[dict(row) for row in cached[1]],'cache_hit':True,'provider':'ddgs'},None
     try:
-        # Serialize provider calls: parallel voice/text turns must not multiply identical
+        # Serialize provider calls: parallel chat requests must not multiply identical
         # requests or trigger avoidable upstream throttling.
         with _SEARCH_CACHE_LOCK:
             cached=_SEARCH_CACHE.get(cache_key)
@@ -138,8 +139,8 @@ def search_ollama(query: str, max_results=8):
 
 
 def _chat(messages, model, timeout=10):
-    response=requests.post(os.getenv('OLLAMA_BASE_URL','https://ollama.com').rstrip('/')+'/api/chat',
-        headers={'Authorization':'Bearer '+os.getenv('OLLAMA_API_KEY','')},
+    response=requests.post(base_url()+'/api/chat',
+        headers=chat_headers(),
         json={'model':model,'messages':messages,'tools':TOOLS,'stream':False,'think':False,
               'options':{'temperature':0,'num_predict':220}},timeout=(4,timeout))
     response.raise_for_status()

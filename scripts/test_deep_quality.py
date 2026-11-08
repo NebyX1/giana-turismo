@@ -66,7 +66,7 @@ class DeepQuality(unittest.TestCase):
         self.assertEqual(len(rank.call_args.args[0]), 20)
         self.assertEqual(result[0]['title'], '19')
 
-    def test_routes_with_stt_damage_and_topic_switch(self):
+    def test_routes_with_typo_and_topic_switch(self):
         cases = [('Salud', CONVERSATION), ('¡Salud!', CONVERSATION),
                  ('Cá en la web, información sobre eventos culturales', WEB_FOLLOWUP),
                  ('Información sobre eventos culturales', CURRENT_INFO),

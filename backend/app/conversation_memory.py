@@ -17,7 +17,7 @@ _RECALL_PATTERNS = (
 
 
 def is_recap_request(text: str) -> bool:
-    """Detect an explicit reference to our prior speech, even after STT noise."""
+    """Detect an explicit reference to a previous answer, including informal wording."""
     normalized = re.sub(r"\s+", " ", plain(text)).strip()
     return any(re.search(pattern, normalized) for pattern in _RECALL_PATTERNS)
 

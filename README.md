@@ -1,165 +1,114 @@
-# Giana Turismo
+# Gianna Turismo
 
-Asistente turístico de Lavalleja con frontend React/Vite, voz en tiempo real y RAG híbrido local. Este repositorio incluye el corpus turístico y la base SQLite FTS5 generada para que una réplica no tenga que reconstruir la guía desde cero; los modelos, secretos y el almacenamiento persistente de Qdrant siguen siendo locales.
+Chat turístico de Lavalleja, Uruguay. Conserva la guía, el catálogo, la recuperación
+híbrida, la memoria de conversación, el reloj de Uruguay, las fuentes y la
+investigación web. La interfaz es exclusivamente de texto.
 
-## Arquitectura actual
+## Modelos y ejecución
 
-La aplicación está separada en frontend, transporte/pipeline de voz, backend de
-conocimiento y servicios locales. El frontend React/Vite usa HTTP para texto y
-SmallWebRTC/Pipecat para voz. El runner de voz aplica Silero VAD, STT configurable
-(`whisper_turbo` CUDA por defecto o Moonshine CPU), SmartTurn y una barrera
-`TurnState` antes de enviar el turno completo al backend Flask. El backend combina
-enrutamiento semántico, fast paths locales, SQLite FTS5, Granite + Qdrant, RRF,
-mMARCO y respuestas verificadas. Las consultas actuales pueden activar búsqueda
-web con consentimiento y evidencia efímera. Piper HTTP sigue siendo el TTS
-operativo; existe un adaptador Kokoro CUDA seleccionable, pero no es el builder
-activo por defecto.
-
-```text
-Browser :5173
-  ├─ texto ──► Vite proxy ──► Flask :5000
-  │                              ├─ router semántico / reloj / persona
-  │                              ├─ SQLite FTS5 + Granite CUDA + Qdrant :6333
-  │                              ├─ mMARCO reranker CUDA
-  │                              ├─ web research + consentimiento
-  │                              └─ Ollama Cloud
-  │
-  └─ voz WebRTC ──► Pipecat :7860
-                    ├─ Silero VAD + Whisper Turbo CUDA / Moonshine CPU
-                    ├─ SmartTurn + TurnState
-                    ├─ HTTP ► Flask :5000
-                    └─ Piper HTTP :5001 ──► audio WebRTC ──► Browser
-```
-
-El diagrama técnico completo, los contratos y los límites del snapshot están en
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
-
-## Requisitos
-
-- Windows 11 está soportado y es el entorno probado actualmente. Linux/Ubuntu y
-  WSL2 también son válidos para los scripts Bash.
-- Python 3.11 es la versión verificada en Windows; Node.js 22 y npm para el
-  frontend.
-- CUDA y una GPU NVIDIA son necesarias para el perfil actual: Whisper Turbo,
-  Granite y mMARCO se ejecutan localmente en CUDA.
-- Docker Desktop con el motor Linux/WSL2 ejecuta Qdrant. No hay un contenedor de
-  desarrollo del frontend en `docker-compose.yml`; el frontend se ejecuta con
-  npm/Vite.
-- `OLLAMA_API_KEY` válida para Ollama Cloud.
-- Qdrant debe estar accesible en `http://127.0.0.1:6333` cuando se inicia el
-  backend.
-- En esta instalación están preparados localmente el modelo Whisper Turbo, la
-  voz Piper y el corpus. No se publican en GitHub y una instalación nueva debe
-  obtenerlos o generarlos por separado.
-
-## Instalación
-
-En Windows 11, desde PowerShell:
-
-```powershell
-Copy-Item .env.example .env
-py -3.11 -m venv .venv
-& .\.venv\Scripts\python.exe -m pip install -r backend\requirements.txt
-& .\.venv\Scripts\python.exe -m pip install -r voice\requirements.txt
-Push-Location frontend
-npm ci
-Pop-Location
-docker compose up -d qdrant
-```
-
-Después de preparar el corpus, los pesos y el índice local, iniciá el stack con:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\start_production.ps1
-```
-
-En Linux o WSL2 se puede usar el bootstrap Bash:
-
-```bash
-cp .env.example .env
-bash scripts/bootstrap.sh
-```
-
-Configurá `OLLAMA_API_KEY` en `.env` sin versionarlo. El bootstrap instala
-dependencias y crea directorios, pero no descarga modelos ni datasets grandes.
-
-## Componentes externos
-
-| Componente | Finalidad | Ejecución/configuración |
+| Función | Modelo | Ejecución |
 |---|---|---|
-| `ibm-granite/granite-embedding-97m-multilingual-r2` | Embeddings | Local, CUDA; `EMBEDDING_MODEL` |
-| `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` | Reranking | Local, CUDA; `RERANKER_MODEL` |
-| `mobiuslabsgmbh/faster-whisper-large-v3-turbo` (`openai/whisper-large-v3-turbo`) | STT predeterminado | Local, faster-whisper/CTranslate2, CUDA `int8_float16`; `STT_PROVIDER=whisper_turbo` |
-| Moonshine ES | STT de rollback | Local, CPU; `STT_PROVIDER=moonshine` |
-| Silero VAD + `LocalSmartTurnAnalyzerV3` | Detección y cierre de turnos | Local, CPU; Pipecat |
-| `es_AR-daniela-high` | TTS activo | Piper local, CPU, HTTP en `:5001`; `TTS_PROVIDER=piper` |
-| `hexgrad/Kokoro-82M` / `ef_dora` | TTS alternativo | Adaptador CUDA probado en `voice/tts/kokoro_service.py`; requiere `TTS_PROVIDER=kokoro` y no es el perfil activo |
-| `deepseek-v4.1-flash:cloud` | Router semántico y respuesta principal | Ollama Cloud; `backend/app/runtime_config.json` |
-| `gemma4:31b-cloud` | Fallback de router/respuesta e investigación web | Ollama Cloud; `backend/app/runtime_config.json` |
-| DDGS + Ollama Web Search | Investigación web | DDGS primario y Ollama Cloud como fallback; `web_search_provider` |
-| Qdrant | Índice vectorial | Docker Desktop/WSL2, `QDRANT_URL` |
+| Embeddings | `ibm-granite/granite-embedding-97m-multilingual-r2` | ONNX INT8 AVX2, CPU, vectores de 384 dimensiones |
+| Reranking | `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` | ONNX INT8 AVX2, CPU |
+| Router y respuestas | `deepseek-v4.1-flash:cloud` | Ollama Cloud mediante la aplicación local de Ollama |
 
-`runtime_config.json` es la fuente efectiva de los modelos cloud; `OLLAMA_MODEL` y
-`OLLAMA_FALLBACK_MODEL` heredados en un `.env` antiguo no sustituyen esa
-configuración. Los pesos locales y la voz ONNX no se incluyen en GitHub. El
-servidor Piper espera que `models/piper/es_AR-daniela-high.onnx` exista al iniciar
-el perfil Piper.
+Los dos modelos de recuperación están fijados por ID, revisión y SHA256 en
+`backend/app/model_policy.py`. No hay selección de otros embeddings o rerankers.
+Se descargan únicamente los pesos cuantizados y los tokenizadores: unos 259 MB
+en total. ONNX Runtime ejecuta la inferencia directamente, sin un framework de
+entrenamiento. El perfil predeterminado usa 4 hilos, lotes de 8 y hasta 512 tokens.
+Granite utiliza el vector CLS normalizado, como especifica su
+[modelo oficial](https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2).
 
-## RAG
+Qdrant se ejecuta embebido y persiste en `storage/qdrant`. SQLite FTS5 aporta la
+búsqueda léxica. El backend sirve también la interfaz compilada: sólo se mantiene
+un proceso del proyecto, sin servicios adicionales de infraestructura.
 
-La implementación está en `backend/app/main.py`, `scripts/ingest.py` y `scripts/index_qdrant.py`. El repositorio incluye `data/source` y los artefactos reproducibles de `data/generated`:
+## Instalación local en Windows
 
-- `data/source/Guia_Turistica_Lavalleja_Consolidada_v4(2).md`: fuente de verdad de la guía, con 4.088 líneas y 243 fuentes.
-- `data/generated/giana.sqlite3`: SQLite con FTS5, entidades, contactos y catálogo usada directamente por Flask.
-- `data/generated/*.jsonl`, `aliases.json` y `manifest.json`: bloques, chunks, catálogo, FAQ, fuentes, aliases y hash del corpus.
+Requisitos: Python 3.12 de 64 bits, Node.js 22.12 o posterior, npm y Ollama con
+sesión iniciada. Los modelos INT8 seleccionados requieren una CPU con AVX2.
 
-La colección Qdrant no se versiona porque es un índice binario/runtime. Para reconstruirla en otra máquina:
-
-1. Instalá el modelo de embeddings `ibm-granite/granite-embedding-97m-multilingual-r2` y las dependencias.
-2. Si se desea regenerar la base, ejecutá `python scripts/ingest.py`; debe coincidir el SHA256 de `data/generated/manifest.json`.
-3. Ejecutá `python scripts/index_qdrant.py` para crear `giana_granite_v2` y cargar los vectores en Qdrant.
-4. `scripts/start_production.ps1` y `.sh` realizan ese indexado automáticamente si Qdrant está vacío.
-
-Los modelos/pesos, las voces ONNX, los secretos y la colección Qdrant no se
-versionan. El corpus y los derivados pequeños sí forman parte de esta entrega.
-
-## Arranque
-
-El arranque ordenado de producción es:
-
-```bash
-bash scripts/start_production.sh
-```
-
-En Windows PowerShell:
+Desde la raíz del repositorio, en PowerShell:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/start_production.ps1
+ollama run deepseek-v4.1-flash:cloud
+# Salir de la conversación de consola con /bye.
+powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
+powershell -ExecutionPolicy Bypass -File scripts\start_giana.ps1
 ```
 
-Estos scripts verifican Qdrant, Piper, backend, voz y frontend en ese orden; la interfaz sólo se inicia después de que los servicios anteriores responden. Para desarrollo completo también se conserva:
+Abrí [Gianna local](http://127.0.0.1:5000). La instalación crea `.venv` y `.env`,
+instala las versiones verificadas de Python y npm, prepara los dos modelos,
+compila la interfaz y genera el índice de los 555 fragmentos de la guía.
+El script de inicio reutiliza un índice compatible y lo reconstruye si cambia
+el corpus o la configuración de embeddings. No ejecutes el instalador ni el
+indexador mientras esté abierto el backend.
 
-```bash
-bash scripts/start_giana_clean.sh
+Ollama debe permanecer abierto. La inferencia de DeepSeek se realiza en la nube;
+necesita conexión a Internet y una sesión de Ollama autorizada para ese modelo.
+La API local usa `http://127.0.0.1:11434` y no necesita copiar credenciales,
+según el [esquema de autenticación de Ollama](https://docs.ollama.com/api/authentication).
+Para acceso directo a Ollama Cloud, configurá `OLLAMA_BASE_URL=https://ollama.com`
+y `OLLAMA_API_KEY` en `.env`. La búsqueda DDGS funciona sin esa clave; el proveedor
+web alternativo de Ollama sí requiere una API key.
+
+## Operación
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\status_giana.ps1
+powershell -ExecutionPolicy Bypass -File scripts\stop_giana.ps1
 ```
 
-Requiere `.env`, corpus, pesos locales y dependencias instaladas. Para componentes individuales se conservan `scripts/start-dev.sh`, `scripts/start-dev.ps1`, `voice/bot.py -t webrtc` y el servidor Piper usado por `start_giana_clean.sh`. Qdrant se levanta con:
+`start_giana.ps1` recompila la interfaz; `-NoBuild` reutiliza la compilación
+existente. Los logs quedan en `logs/backend.log` y `logs/backend.err.log`.
+El servidor escucha únicamente en `127.0.0.1:5000` y usa Waitress.
+`/ready` verifica los modelos calentados y la compatibilidad del índice;
+`/api/diagnostics` informa el proveedor CPU y la configuración de inferencia.
+Activá `GIANA_DIAGNOSTICS=true` para registrar eventos del chat en `logs/`.
 
-```bash
-docker compose up -d qdrant
+Para desarrollo, iniciá el backend y ejecutá `npm run dev` desde `frontend`.
+Vite publica la interfaz en `http://localhost:5173` y reenvía `/api` al backend.
+
+## Corpus y validación
+
+La fuente está en `data/source/Guia_Turistica_Lavalleja_Consolidada_v4(2).md`.
+Los datos derivados versionados incluyen SQLite, 510 bloques, 555 fragmentos,
+133 entradas de catálogo, 34 FAQ y 243 fuentes. Para regenerarlos:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\stop_giana.ps1
+.\.venv\Scripts\python.exe scripts\ingest.py
+.\.venv\Scripts\python.exe scripts\index_qdrant.py --force
 ```
 
-## Puertos
+Con el backend detenido, ejecutá las pruebas locales y el benchmark:
 
-- Frontend Vite: `5173`
-- Backend Flask: `5000`
-- Piper HTTP: `5001`
-- SmallWebRTC/Pipecat: `7860`
-- Qdrant: `6333` y `6334`
+```powershell
+.\.venv\Scripts\python.exe scripts\verify_cpu.py
+.\.venv\Scripts\python.exe scripts\run_tests.py
+```
 
-## Estado del snapshot
+Con el backend iniciado, la prueba completa usa también DeepSeek Cloud:
 
-Este repositorio contiene código fuente, configuración, scripts, tests,
-documentación y la base de conocimiento curada. Se excluyen intencionalmente
-secretos, `.env` reales, modelos/pesos, voces ONNX, índices Qdrant, caches, logs,
-traces, audios, builds, `node_modules` y virtualenvs.
+```powershell
+.\.venv\Scripts\python.exe scripts\smoke_chat.py
+```
+
+Las pruebas de navegador usan Chrome y Playwright; se instalan por separado:
+
+```powershell
+Push-Location tests\e2e
+npm ci
+node chat_smoke.mjs
+node stale_text.mjs
+node check_auto_web_progress.mjs
+Pop-Location
+```
+
+El navegador verifica respuestas reales, fuentes, escritorio/móvil, nuevas
+conversaciones y progreso de búsqueda. Los resultados locales quedan en `reports/`.
+
+Los modelos, el índice, las credenciales y los entornos instalados son locales y
+están excluidos de Git. La arquitectura y los límites del índice se explican en
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).

@@ -1,6 +1,4 @@
-export type ConversationState = 'IDLE' | 'CONNECTING' | 'LISTENING' | 'TRANSCRIBING' | 'WAITING_TRANSCRIPT' | 'RETRIEVING' | 'THINKING' | 'WEB_SEARCHING' | 'SPEAKING' | 'INTERRUPTED' | 'ERROR';
-export type VoiceState = ConversationState;
-export type MessageRole = 'user' | 'assistant' | 'system_status';
+export type ConversationState = 'IDLE' | 'RETRIEVING' | 'WEB_SEARCHING' | 'ERROR';
 
 export type EvidenceSource = {
   title: string;
@@ -16,11 +14,8 @@ export type EvidenceSource = {
 
 export type ConversationMessage = {
   id: string;
-  role: MessageRole;
+  role: 'user' | 'assistant';
   content: string;
   timestamp: string;
-  state?: ConversationState;
   sources?: EvidenceSource[];
-  pending?: boolean;
-  local?: boolean;
 };
