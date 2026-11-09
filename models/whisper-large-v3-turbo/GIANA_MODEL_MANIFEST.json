@@ -1,0 +1,12 @@
+{
+  "requested_model": "openai/whisper-large-v3-turbo",
+  "effective_ct2_repo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+  "revision": "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf",
+  "path": "D:\\Ai Projects\\Giana-Turismo-V2\\models\\whisper-large-v3-turbo",
+  "files": {
+    "config.json": true,
+    "model.bin": true,
+    "tokenizer.json": true,
+    "preprocessor_config.json": true
+  }
+}

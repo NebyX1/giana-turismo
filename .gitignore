@@ -31,7 +31,7 @@ logs/
 run/*.pid
 run/*counters*.json
 reports/
-run/
+voice_trace*
 
 # Runtime databases and generated indexes
 *.sqlite
@@ -61,7 +61,7 @@ data/*
 storage/*
 !storage/.gitkeep
 
-# Downloaded model artifacts
+# Model weights and downloaded voices; source code named models is allowed
 *.onnx
 *.onnx.data
 *.gguf
@@ -71,7 +71,7 @@ storage/*
 *.pth
 *.ckpt
 *.bin
-models/
+voice/piper/*.onnx.json
 models/cache/
 model_cache/
 huggingface/

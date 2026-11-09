@@ -35,7 +35,7 @@ class Resilience(unittest.TestCase):
             r=self.client.post('/api/ask-text',json={'question':'Hola Giana, ¿estás ahí?','session_id':'offline'})
         self.assertEqual(r.status_code,200)
         self.assertEqual(r.json['route'],'CONVERSATION')
-        self.assertIn('leo',r.json['answer'])
+        self.assertIn('escucho',r.json['answer'])
 
     def test_semantic_conversation_not_in_phrase_list(self):
         with patch.object(app,'ROUTER_MODE','tools'),patch.object(app,'select_tool',return_value={'tool':'conversation','error':None}),patch.object(app,'retrieve',side_effect=AssertionError('no retrieval')):
@@ -44,7 +44,7 @@ class Resilience(unittest.TestCase):
 
     def test_scope_tool_returns_model_wording_with_context_without_retrieval(self):
         answer = 'Lamento que te hayas perdido. No conozco tu domicilio; puedo asesorarte sobre turismo en Lavalleja.'
-        app.remember_turn('scope-unit', 'Hola', 'Sí, te leo.', CONVERSATION)
+        app.remember_turn('scope-unit', 'Hola', 'Sí, te escucho.', CONVERSATION)
         with patch.object(app, 'ROUTER_MODE', 'tools'), \
              patch('backend.app.semantic_router.requests.post') as post, \
              patch.object(app, 'retrieve', side_effect=AssertionError('out-of-scope must not use RAG')), \
@@ -60,7 +60,7 @@ class Resilience(unittest.TestCase):
         self.assertFalse(response.json['web_invoked'])
         self.assertEqual(post.call_count, 1)
         messages = post.call_args.kwargs['json']['messages']
-        self.assertEqual(messages[-2]['content'], 'Sí, te leo.')
+        self.assertEqual(messages[-2]['content'], 'Sí, te escucho.')
         self.assertEqual(messages[-1]['content'], 'Me perdí y no sé cómo llegar a casa.')
 
     def test_scope_missing_or_invalid_wording_keeps_scope_route_and_safe_fallback(self):
@@ -204,8 +204,8 @@ class Resilience(unittest.TestCase):
             captured.append(list(history))
             return {'tool':'knowledge','query':'teléfono Don Jorgito','error':None}
         with patch.object(app,'ROUTER_MODE','tools'),patch.object(app,'select_tool',side_effect=tool),patch.object(app,'retrieve',return_value=(EVIDENCE,'HYBRID_RERANK')),patch.object(app,'llm_answer',return_value=(GOOD,None)):
-            self.client.post('/api/ask-text',json={'question':'¿Y su teléfono?','session_id':'text-new','conversation_id':'chat-a'})
-            self.client.post('/api/ask-text',json={'question':'Una consulta','session_id':'text-other','conversation_id':'chat-b'})
+            self.client.post('/api/ask-text',json={'question':'¿Y su teléfono?','session_id':'voice-new','conversation_id':'chat-a'})
+            self.client.post('/api/ask-text',json={'question':'Una consulta','session_id':'voice-other','conversation_id':'chat-b'})
         self.assertEqual(captured[0][0]['assistant'],'Av Varela 947');self.assertEqual(captured[1],[])
 
 if __name__=='__main__':unittest.main()

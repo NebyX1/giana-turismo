@@ -1,73 +1,102 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { useBackendStatus, useWebSearchProgress } from './hooks';
+import { Dismiss16Regular } from '@fluentui/react-icons';
+import { Button } from '@fluentui/react-components';
+import { useVoiceSession, useWebSearchProgress } from './hooks';
 import { useConversationStore } from './store';
 import { Composer, ConversationView, DebugPanel, TopBar, WebConsentCard, WebSearchOverlay } from './components';
 import { stripCitationMarkers } from './presentation';
+import type { ConversationMessage } from './types';
 
-const errorMessage = (code: string) => ({
-  LLM_UNAVAILABLE: 'No pude conectar con Ollama. Revisá que esté abierto y tenga la sesión iniciada.',
-  RAG_INDEX_UNAVAILABLE: 'La guía todavía no está lista. Revisá el estado del servidor.',
-  ANSWER_TIMEOUT: 'La consulta está demorando más de lo previsto. Probá nuevamente.',
-}[code] || 'No pude completar la consulta. Probá nuevamente.');
+const CONVERSATION_IDLE_RESET_MS = 3 * 60 * 1000;
+
+function latestConversationActivity(messages: ConversationMessage[]) {
+  const latest = messages[messages.length - 1];
+  return latest ? `${latest.id}\n${latest.timestamp}` : '';
+}
+
+const looksLikeWebRequest = (text: string) => {
+  const q = text.toLocaleLowerCase('es-UY');
+  return /\b(busca|buscá|buscar|consultá|consulta|averiguá|averigua|revisá|revisa)\b.*\b(web|internet|online|google)\b|\ben internet\b|\bweb\b/i.test(q)
+    || /\b(eventos?|agenda|cartelera|actividades? culturales?|festival(?:es)?|conciertos?|funciones?)\b/i.test(q)
+    || /\b(esta semana|mañana|manana|hoy|ahora|este mes|próxima semana|proxima semana|fin de semana)\b.*\b(evento|actividad|agenda|cartelera|cultural|abierto|horario|disponibilidad)\b/i.test(q)
+    || /\b(está abierto|esta abierto|horario|disponibilidad|vigente|actualizado)\b/i.test(q);
+};
 
 export function AppShell() {
   useWebSearchProgress();
-  const ready = useBackendStatus();
-  const store = useConversationStore();
-  const [error, setError] = useState('');
-  const activeRequest = useRef<AbortController | null>(null);
-  const reset = useCallback(() => {
-    activeRequest.current?.abort();
-    useConversationStore.getState().clearConversation();
-    setError('');
-  }, []);
-
-  useEffect(() => () => { activeRequest.current?.abort(); }, []);
+  const { toggle, disconnect } = useVoiceSession(); const consent = useConversationStore((s) => s.pendingWebConsent); const store = useConversationStore(); const [error, setError] = useState('');
+  const conversationId = useConversationStore((s) => s.conversationId);
+  const lastActivity = useConversationStore((s) => latestConversationActivity(s.messages));
+  const disconnectRef = useRef(disconnect);
+  disconnectRef.current = disconnect;
   useEffect(() => {
-    if (!store.messages.length || ['RETRIEVING', 'WEB_SEARCHING'].includes(store.status)) return;
-    const timer = window.setTimeout(reset, 3 * 60 * 1000);
-    return () => window.clearTimeout(timer);
-  }, [store.messages, store.status, reset]);
-
-  const sendText = useCallback(async (text: string) => {
-    const current = useConversationStore.getState();
-    if (['RETRIEVING', 'WEB_SEARCHING'].includes(current.status)) return;
-    const conversationId = current.conversationId;
-    const generationId = crypto.randomUUID();
-    const isCurrent = () => {
-      const latest = useConversationStore.getState();
-      return latest.conversationId === conversationId && latest.currentGenerationId === generationId;
-    };
-    current.addUserMessage(text);
-    current.setGenerationId(generationId);
-    current.setStatus('RETRIEVING');
-    setError('');
-    const controller = new AbortController();
-    activeRequest.current = controller;
-    const timeout = window.setTimeout(() => controller.abort(), 90000);
-    try {
-      const response = await fetch('/api/ask-text', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
-        body: JSON.stringify({ question: text, session_id: conversationId, turn_id: `text-${Date.now()}`, generation_id: generationId, source: 'human' }),
+    if (!lastActivity) return;
+    const separator = lastActivity.lastIndexOf('\n');
+    const lastActivityAt = Date.parse(lastActivity.slice(separator + 1));
+    const elapsed = Number.isFinite(lastActivityAt) ? Math.max(0, Date.now() - lastActivityAt) : 0;
+    const delay = Math.max(0, CONVERSATION_IDLE_RESET_MS - elapsed);
+    const timer = window.setTimeout(() => {
+      const isSameConversation = () => {
+        const current = useConversationStore.getState();
+        return current.conversationId === conversationId
+          && latestConversationActivity(current.messages) === lastActivity;
+      };
+      if (!isSameConversation()) return;
+      void disconnectRef.current().catch(() => undefined).finally(() => {
+        if (!isSameConversation()) return;
+        const current = useConversationStore.getState();
+        current.clearConversation();
+        current.setVoiceSessionId(null);
+        setError('');
       });
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [conversationId, lastActivity]);
+  const reportError = (errorCode: string, message: string, turnId = '') => { const qaSessionId = new URLSearchParams(window.location.search).get('qa_session') || ''; void fetch('/api/debug/trace', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ component: 'frontend', event: 'frontend_error_displayed', source: 'human', qa_session_id: qaSessionId, session_id: store.conversationId, turn_id: turnId, generation_id: store.currentGenerationId || '', status: 'error', error_code: errorCode, detail: JSON.stringify({ error_code: errorCode, source_component: 'AppShell', message }) }) }).catch(() => undefined); };
+  useEffect(() => {
+    if (!['RETRIEVING', 'WEB_SEARCHING', 'WAITING_TRANSCRIPT'].includes(store.voiceState)) return;
+    const waitingTranscript = store.voiceState === 'WAITING_TRANSCRIPT';
+    const timer = window.setTimeout(() => {
+      const message = waitingTranscript ? 'No pude entender lo que dijiste. Probá nuevamente.' : 'La consulta está demorando más de lo previsto. Podés volver a intentarlo.';
+      store.setVoiceState('ERROR'); setError(message);
+      reportError(waitingTranscript ? 'STT_TRANSCRIPT_MISSING_AFTER_TURN_COMPLETE' : 'ANSWER_TIMEOUT', message);
+    }, waitingTranscript ? 15000 : 65000);
+    return () => window.clearTimeout(timer);
+  }, [store.voiceState]);
+  useEffect(() => {
+    if (store.voiceState === 'IDLE' || store.voiceState === 'LISTENING' || store.voiceState === 'SPEAKING') setError('');
+  }, [store.voiceState]);
+  useEffect(() => { const params = new URLSearchParams(window.location.search); const code = params.get('e2e_force_error'); if (params.get('e2e_test_mode') !== 'true' || !code) return; const message = code === 'LLM_TIMEOUT' ? 'El modelo tardó demasiado. Probá de nuevo.' : 'Error controlado de prueba.'; store.setVoiceState('ERROR'); setError(message); reportError(code, message, `e2e-${Date.now()}`); }, []);
+  const sendText = useCallback(async (text: string) => {
+    const conversationId = store.conversationId;
+    const generationId = crypto.randomUUID();
+    const turnId = `text-${Date.now()}`;
+    const isCurrent = () => {
+      const current = useConversationStore.getState();
+      return current.conversationId === conversationId && current.currentGenerationId === generationId;
+    };
+    store.addUserMessage(text);
+    store.setVoiceState(looksLikeWebRequest(text) ? 'WEB_SEARCHING' : 'RETRIEVING');
+    store.setGenerationId(generationId);
+    try {
+      const response = await fetch('/api/ask-text', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question: text, session_id: conversationId, turn_id: turnId, generation_id: generationId, source: 'human' }) });
       const data = await response.json();
+      // A response from before New Conversation (or a superseded request)
+      // cannot write content, consent or errors into the current conversation.
       if (!isCurrent()) return;
-      if (data.state === 'ASKING_WEB_PERMISSION') {
-        current.setWebConsent({ query: text }); current.setStatus('IDLE'); return;
-      }
+      if (data.state === 'ASKING_WEB_PERMISSION') { store.setWebConsent({ query: text }); return; }
       if (!response.ok) throw new Error(data.error_code || 'UNKNOWN_ERROR');
-      current.addAssistantMessage(stripCitationMarkers(data.answer || 'No encontré evidencia suficiente en la guía local.'), data.evidence?.length ? data.evidence : data.searched_sources || []);
-      current.setStatus('IDLE');
-    } catch (reason) {
+      store.setVoiceState('IDLE');
+      const answer = stripCitationMarkers(data.answer || 'No encontré evidencia suficiente en la guía local.');
+      const sources = data.evidence?.length ? data.evidence : data.searched_sources || [];
+      const id = store.addAssistantMessage(answer, sources, false);
+      store.finishAssistant(id, answer, sources);
+    } catch (e) {
       if (!isCurrent()) return;
-      const code = controller.signal.aborted ? 'ANSWER_TIMEOUT' : reason instanceof Error ? reason.message : 'UNKNOWN_ERROR';
-      setError(errorMessage(code)); current.setStatus('ERROR');
-    } finally {
-      window.clearTimeout(timeout);
-      if (activeRequest.current === controller) activeRequest.current = null;
+      const message = e instanceof Error ? e.message : 'UNKNOWN_ERROR';
+      const code = message.includes('LLM') ? 'LLM_TIMEOUT' : message.includes('RAG') ? 'RAG_ERROR' : 'UNKNOWN_ERROR';
+      reportError(code, message, turnId); setError(message); store.setVoiceState('ERROR');
     }
-  }, []);
-
-  const consent = store.pendingWebConsent;
-  return <div className="app-shell"><TopBar onNew={reset} ready={ready} /><ConversationView onSuggestion={sendText} /><WebSearchOverlay /><footer className="composer-dock"><div className="composer-inner">{consent && <WebConsentCard query={consent.query} onAccept={() => { store.setWebConsent(null); void sendText(`${consent.query} buscá en la web`); }} onReject={() => store.setWebConsent(null)} />}{error && <div className="inline-error" role="alert"><span>{error}</span><button onClick={() => setError('')} aria-label="Cerrar error">×</button></div>}<Composer onSend={sendText} /></div></footer><DebugPanel /></div>;
+  }, [store]);
+  return <div className="app-shell"><TopBar onNew={() => { void disconnect().then(() => { store.clearConversation(); store.setVoiceSessionId(null); setError(''); }); }} /><ConversationView onSuggestion={sendText} /><WebSearchOverlay /><footer className="composer-dock"><div className="composer-inner">{consent && <WebConsentCard query={consent.query} onAccept={() => { store.setWebConsent(null); void sendText(`${consent.query} buscá en la web`); }} onReject={() => store.setWebConsent(null)} />}{error && <div className="inline-error"><span>{error}</span><Button appearance="subtle" icon={<Dismiss16Regular />} onClick={() => setError('')} aria-label="Cerrar error" /></div>}<Composer onSend={sendText} onMic={async () => { try { await toggle(); } catch (e) { const message = e instanceof Error ? e.message : 'No pude acceder al micrófono.'; reportError(message.includes('WEBRTC') ? 'WEBRTC_ERROR' : 'UNKNOWN_ERROR', message); setError(message); } }} onSuggestion={sendText} /></div></footer><DebugPanel /></div>;
 }

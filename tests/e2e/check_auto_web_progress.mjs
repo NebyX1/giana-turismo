@@ -17,7 +17,7 @@ try {
       web_invoked: true, rag_invoked: true, evidence: [],
     }) });
   });
-  await page.goto(process.env.GIANA_BASE_URL || 'http://127.0.0.1:5000');
+  await page.goto('http://localhost:5173');
   await page.getByRole('textbox', { name: 'Mensaje para Gianna' }).fill('¿Hay un restaurante de comida etíope en Minas?');
   await page.getByRole('button', { name: 'Enviar mensaje', exact: true }).click();
   await expect(page.locator('.status-retrieving')).toBeVisible();

@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from backend.app.intent_router import CONVERSATION, CURRENT_INFO, GIANA_META, OUT_OF_SCOPE, TOURISM_RAG, WEB_FOLLOWUP, classify_intent, conversation_answer, conversation_kind, normalize_query
+from backend.app.intent_router import CONVERSATION, CURRENT_INFO, GIANA_META, OUT_OF_SCOPE, TOURISM_RAG, WEB_FOLLOWUP, classify_intent, conversation_answer, conversation_kind, normalize_transcript
 
 
 CASES = {
@@ -68,7 +68,7 @@ for query, (expected, rag) in CASES.items():
     assert actual_rag == rag, f"{query!r}: expected rag={rag}, got rag={actual_rag}"
 
 for raw, expected in NORMALIZATION.items():
-    actual = normalize_query(raw)
+    actual = normalize_transcript(raw)
     assert actual == expected, f"normalize {raw!r}: expected {expected!r}, got {actual!r}"
 
 assert conversation_kind('¿Sos estúpida?') == 'abuse'

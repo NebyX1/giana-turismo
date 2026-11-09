@@ -29,8 +29,8 @@ FOREIGN_PLACES = (
     "cordoba", "rosario", "gramado", "florianópolis", "florianopolis", "porto alegre",
 )
 
-# Variantes ortográficas y alias de topónimos del corpus.
-PLACE_ALIASES = {
+# Variantes que Moonshine produce con frecuencia para topónimos del corpus.
+STT_ALIASES = {
     "arequita": ("ser varequita", "cerro arequitá", "ser arequita", "varequita", "arekita", "are quita", "arequíta", "arequitá"),
     "minas": ("ciudadaninas", "ciudad de minas"),
     "villa serrana": ("villaserrana", "villa cerrana", "villa serana", "bilha serrana", "villaserana"),
@@ -45,10 +45,10 @@ PLACE_ALIASES = {
 CANONICAL_FORMS = {"arequita": "Cerro Arequita", "giana": "Giana", "salus": "Parque Salus"}
 
 
-def normalize_query(text: str) -> str:
-    """Normaliza alias y variantes de topónimos antes de clasificar y recuperar."""
+def normalize_transcript(text: str) -> str:
+    """Corrige topónimos mal transcritos por STT antes de clasificar y recuperar."""
     normalized = text
-    for canonical, variants in PLACE_ALIASES.items():
+    for canonical, variants in STT_ALIASES.items():
         replacement = CANONICAL_FORMS.get(canonical, canonical.title())
         for variant in sorted(variants, key=len, reverse=True):
             pattern = re.compile(r"\b" + re.escape(variant) + r"\b", re.IGNORECASE)
@@ -83,7 +83,7 @@ def web_allowed(text):
 
 def conversation_kind(text: str) -> str:
     """Classify bounded social turns that must never reach RAG or the web."""
-    q = re.sub(r'\s+', ' ', plain(normalize_query(text))).strip(' .!¡¿?')
+    q = re.sub(r'\s+', ' ', plain(normalize_transcript(text))).strip(' .!¡¿?')
     if re.search(
         r'\b(?:hij[ao] de (?:mil )?putas?|la puta que te pario|put[ao]|forr[ao]|idiota|imbecil|estupid[ao]|'
         r'inutil|pelotud[ao]|bolud[ao]|tarad[ao]|malparid[ao]|basura|mierda|callate|cerra el orto|andate|'
@@ -120,7 +120,7 @@ def pure_conversation(text: str) -> bool:
     """
     if conversation_kind(text):
         return True
-    q = re.sub(r'[^a-z0-9 ]', ' ', plain(normalize_query(text)))
+    q = re.sub(r'[^a-z0-9 ]', ' ', plain(normalize_transcript(text)))
     q = re.sub(r'\s+', ' ', q).strip()
     units = [r'hola', r'buenas(?: tardes| noches| dias)?', r'buen(?:os)? dias',
              r'giana', r'che', r'bueno', r'por favor',
@@ -135,7 +135,7 @@ def pure_conversation(text: str) -> bool:
 
 
 def classify_intent(text: str) -> str:
-    q = re.sub(r"\s+", " ", normalize_query(text).lower().strip())
+    q = re.sub(r"\s+", " ", normalize_transcript(text).lower().strip())
     plain_q = plain(q)
     if pure_conversation(q):
         return CONVERSATION
@@ -164,7 +164,7 @@ def classify_intent(text: str) -> str:
     )
     if any(term in q for term in current_terms):
         return CURRENT_INFO
-    presence_check = re.search(r"\b(?:me (?:pod[eé]s )?escuchar|me escuch[aá]s|pod[eé]s escucharme|me o[íi]s|pod[eé]s escuchar(?: lo que| bien)?|me est[aá]s escuchando)\b", q)
+    audio_check = re.search(r"\b(?:me (?:pod[eé]s )?escuchar|me escuch[aá]s|pod[eé]s escucharme|me o[íi]s|pod[eé]s escuchar(?: lo que| bien)?|me est[aá]s escuchando)\b", q)
     tourism_terms = (
         "minas", "lavalleja", "villa serrana", "arequita", "penitente", "comer",
         "comida", "vegano", "alojar", "alojamiento", "hotel", "cabaña", "camping", "geoparque", "paseo",
@@ -176,7 +176,7 @@ def classify_intent(text: str) -> str:
         "como andas", "estás ahí", "estas ahi", "me escuchás", "me escuchas", "chau", "adiós", "adios",
         "muchas gracias", "perfecto", "genial", "bien", "no", "sí", "si", "salud",
     }
-    if q.strip(" .!¡¿?") in conversation_terms or (presence_check and not tourism_query):
+    if q.strip(" .!¡¿?") in conversation_terms or (audio_check and not tourism_query):
         return CONVERSATION
     return TOURISM_RAG
 
@@ -215,15 +215,15 @@ def conversation_answer(text: str, variant: int = 0) -> str:
     if any(term in plain(q) for term in ('entendiendo mal', 'no entendiste', 'no me entendiste')):
         return 'Perdón, entendí mal. Decime qué parte querés que corrija.'
     if any(term in plain(q) for term in ('dejame pensar', 'espera', 'para un momento')):
-        return 'Claro, te leo cuando quieras seguir.'
+        return 'Claro, te escucho cuando quieras seguir.'
     if q.strip(' .!¡¿?') == 'salud':
-        return '¡Salud! Te leo, seguimos cuando quieras.'
+        return '¡Salud! Te escucho, seguimos cuando quieras.'
     if "gracia" in q:
         return "¡De nada! Cuando quieras, seguimos recorriendo Lavalleja."
     if "chau" in q or "adi" in q or 'hasta ' in q:
         return "¡Hasta luego! Que disfrutes Lavalleja."
     if "escuch" in q or "ahí" in q or "ahi" in q or "oís" in q or "ois" in q or any(t in plain(q) for t in ('recibis','funcion','se oye','probando')):
-        return "Sí, te leo. ¿Qué querés conocer de Lavalleja?"
+        return "Sí, te escucho. ¿Qué querés conocer de Lavalleja?"
     return "¡Hola! Decime, ¿en qué te puedo ayudar?"
 
 

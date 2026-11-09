@@ -1,48 +1,33 @@
-﻿param([switch]$NoBuild)
 $ErrorActionPreference = 'Stop'
-$Root = Split-Path -Parent $PSScriptRoot
-$Python = Join-Path $Root '.venv\Scripts\python.exe'
-if (-not (Test-Path -LiteralPath $Python)) { throw 'Primero ejecutá scripts\setup.ps1.' }
-Push-Location $Root
-try {
-    if (-not (Test-Path -LiteralPath .env)) { Copy-Item -LiteralPath .env.example -Destination .env }
-    $LocalConfig = & $Python -m backend.app.model_policy
-    if ($LASTEXITCODE -ne 0) { throw 'Configuración inválida.' }
-    $Port = ($LocalConfig | ConvertFrom-Json).port
-    $Url = "http://127.0.0.1:$Port"
-    $Listener = Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue
-    if ($Listener) {
-        $Existing = Get-CimInstance Win32_Process -Filter "ProcessId=$($Listener[0].OwningProcess)"
-        if ($Existing.CommandLine -like '*backend.app.main*') {
-            # Windows virtualenv launchers may own a base-Python child process.
-            $Owner = $Existing
-            if (-not $Owner.CommandLine.Contains($Root)) {
-                $Owner = Get-CimInstance Win32_Process -Filter "ProcessId=$($Existing.ParentProcessId)"
-            }
-            if ($Owner -and $Owner.CommandLine -like '*backend.app.main*' -and $Owner.CommandLine.Contains($Root)) {
-                Write-Output "Gianna ya está iniciada: $Url"
-                return
-            }
-        }
-        throw "El puerto $Port está ocupado por otro proceso."
-    }
-    if (-not $NoBuild -or -not (Test-Path -LiteralPath frontend\dist\index.html)) {
-        Push-Location frontend
-        try { npm.cmd run build; if ($LASTEXITCODE -ne 0) { throw 'Falló la compilación del frontend.' } }
-        finally { Pop-Location }
-    }
-    New-Item -ItemType Directory -Path logs,run -Force | Out-Null
-    $env:PYTHONUTF8 = '1'
-    $Process = Start-Process -FilePath $Python -ArgumentList '-m','backend.app.main' -WorkingDirectory $Root -WindowStyle Hidden -RedirectStandardOutput (Join-Path $Root 'logs\backend.log') -RedirectStandardError (Join-Path $Root 'logs\backend.err.log') -PassThru
-    $Process.Id | Set-Content -LiteralPath run\backend.pid -Encoding ascii
-    for ($Attempt = 0; $Attempt -lt 120; $Attempt++) {
-        if ($Process.HasExited) { throw 'El backend terminó. Revisá logs\backend.err.log.' }
-        try {
-            $Ready = Invoke-RestMethod "$Url/ready" -TimeoutSec 2
-            if ($Ready.status -eq 'ready') { Write-Output "Gianna lista: $Url"; return }
-        } catch { }
-        Start-Sleep -Seconds 1
-        $Process.Refresh()
-    }
-    throw 'El arranque sigue en curso. Consultá scripts\status_giana.ps1 y los logs.'
-} finally { Pop-Location }
+$Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+Set-Location $Root
+$qaSessionId = ''
+if (Test-Path (Join-Path $Root 'logs\test\CURRENT_QA_SESSION_ID.txt')) { $qaSessionId = (Get-Content (Join-Path $Root 'logs\test\CURRENT_QA_SESSION_ID.txt') -Raw).Trim() }
+$py = Join-Path $Root '.venv\Scripts\python.exe'
+if (-not (Test-Path $py)) { throw 'Falta .venv; ejecutá la instalación del proyecto.' }
+if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { throw 'Docker no está instalado.' }
+docker compose up -d qdrant | Out-Host
+for($i=0;$i -lt 60;$i++){ try { if((Invoke-WebRequest 'http://127.0.0.1:6333/readyz' -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200){break} } catch {}; Start-Sleep 2 }
+if (-not (Invoke-WebRequest 'http://127.0.0.1:6333/readyz' -UseBasicParsing).StatusCode -eq 200) { throw 'Qdrant no llegó a ready.' }
+$exists = $false; try { $exists = [bool](Invoke-RestMethod 'http://127.0.0.1:6333/collections/giana_granite_v2' -TimeoutSec 5) } catch {}
+if (-not $exists) { & $py scripts\index_qdrant.py }
+if (-not (Get-NetTCPConnection -LocalPort 5001 -State Listen -ErrorAction SilentlyContinue)) {
+  $model = (Get-ChildItem models\piper -Filter '*.onnx' | Select-Object -First 1).FullName
+  Start-Process $py -ArgumentList "-m piper.http_server --host 127.0.0.1 --port 5001 --model `"$model`"" -WorkingDirectory $Root -RedirectStandardOutput (Join-Path $Root 'logs\piper.log') -RedirectStandardError (Join-Path $Root 'logs\piper.err')
+}
+if (-not (Get-NetTCPConnection -LocalPort 5000 -State Listen -ErrorAction SilentlyContinue)) {
+  $env:GIANA_DIAGNOSTICS='true'; $env:QA_SESSION_ID=$qaSessionId
+  Start-Process $py -ArgumentList '-m backend.app.main' -WorkingDirectory $Root -RedirectStandardOutput (Join-Path $Root 'logs\backend.log') -RedirectStandardError (Join-Path $Root 'logs\backend.err')
+}
+for($i=0;$i -lt 90;$i++){ try { if((Invoke-WebRequest 'http://127.0.0.1:5000/ready' -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200){break} } catch {}; Start-Sleep 2 }
+if (-not (Get-NetTCPConnection -LocalPort 7860 -State Listen -ErrorAction SilentlyContinue)) {
+  $env:PYTHONUTF8='1'; $env:GIANA_DIAGNOSTICS='true'; $env:GIANA_TRACE_SOURCE='human'; $env:QA_SESSION_ID=$qaSessionId
+  Start-Process $py -ArgumentList '-m voice.bot -t webrtc' -WorkingDirectory $Root -RedirectStandardOutput (Join-Path $Root 'logs\voice.log') -RedirectStandardError (Join-Path $Root 'logs\voice.err')
+}
+if (-not (Get-NetTCPConnection -LocalPort 5173 -State Listen -ErrorAction SilentlyContinue)) { Start-Process 'npm.cmd' -ArgumentList @('run','dev','--','--host=0.0.0.0') -WorkingDirectory (Join-Path $Root 'frontend') -RedirectStandardOutput (Join-Path $Root 'logs\frontend.log') -RedirectStandardError (Join-Path $Root 'logs\frontend.err') }
+Write-Output 'Giana iniciada.'
+Write-Output 'Frontend: http://localhost:5173'
+Write-Output 'Debug:    http://localhost:5173/?debug=1'
+Write-Output 'Backend:  http://localhost:5000'
+Write-Output 'Voice:    http://localhost:7860'
+Write-Output 'Qdrant:   http://localhost:6333'

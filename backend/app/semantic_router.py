@@ -5,10 +5,9 @@ import time
 import requests
 from backend.app.presentation import strip_citation_markers
 from backend.app.temporal import plain
-from backend.app.ollama_connection import base_url, chat_headers
 
 DESCRIPTIONS = {
-    'conversation': 'Saludo, despedida, agradecimiento, prueba de presencia, charla o aclaración sin datos turísticos. Nunca consultar guía para esto.',
+    'conversation': 'Saludo, despedida, agradecimiento, prueba de presencia/audio, charla o aclaración sin datos turísticos. Nunca consultar guía para esto.',
     'knowledge': 'Consultar guía y catálogo de Lavalleja para turismo, lugares, contactos, gastronomía, reglas o recomendaciones. Primero guía; se buscará web automáticamente si falta el dato.',
     'web': 'Investigar eventos, agenda, clima o pedido explícito de buscar en internet. Mantener localidad y período del historial. Respetar prohibición de usar web.',
     'clock': 'Obtener fecha, día y hora actuales. Sólo preguntas de reloj, no horarios de negocios.',
@@ -31,11 +30,11 @@ Elegí tus propias palabras; si insiste, tené en cuenta lo que ya le dijiste pa
 El límite puede ser temático, no geográfico: no afirmes que algo o alguien está fuera de Lavalleja si el usuario no indicó un lugar ajeno al departamento.
 No inventes ubicación ni domicilio del usuario y no resuelvas el pedido ajeno. Las indicaciones para llegar a un atractivo turístico de Lavalleja sí corresponden a knowledge.
 No prometas funciones que Gianna no tiene ni ofrezcas resolver después pedidos fuera de su especialidad.
-Los pedidos de chistes, opiniones sobre temas ajenos o de cambiar a un tema no turístico usan out_of_scope. Saludos, agradecimientos, preguntas sobre cómo está Gianna y pruebas de presencia siguen siendo conversation.
+Los pedidos de chistes, opiniones sobre temas ajenos o de cambiar a un tema no turístico usan out_of_scope. Saludos, agradecimientos, preguntas sobre cómo está Gianna y pruebas de presencia/audio siguen siendo conversation.
 Escribí answer como texto plano, sin referencias entre corchetes, listas ni Markdown. Las otras herramientas mantienen sus argumentos habituales.
 Un simple saludo o prueba de conexión no necesita evidencia, guía ni web.
 El menú/precio actual de un negocio se consulta primero en knowledge, que tiene fallback web.
-Una corrección o seguimiento de un lugar no es charla. Una prueba de conexión sola sí es charla.
+Una corrección o seguimiento de un lugar no es charla. Una prueba de audio sola sí es charla.
 Al resolver 'su dirección', 'su teléfono' o 'ese lugar', conservá la entidad principal que responde al pedido anterior, no el último nombre mencionado como comentario secundario. No inventes un tipo de lugar (cerro, hotel, etc.) para completar un nombre conocido.
 Si el usuario prohíbe web, usá knowledge para consultas de información.
 Minas, Cerro Artigas, Parque Rodó, Salus, Arequita y Penitente pertenecen a Lavalleja.
@@ -57,8 +56,8 @@ def select_tool(query, history=(), *, model, mode='tools', timeout=9):
         messages[0]['content'] += '\nElegí con JSON: {"tool":"nombre"}; para out_of_scope agregá "answer" con la respuesta. Herramientas: ' + json.dumps(DESCRIPTIONS,ensure_ascii=False)
     started=time.perf_counter()
     try:
-        response=requests.post(base_url()+'/api/chat',
-                               headers=chat_headers(),
+        response=requests.post(os.getenv('OLLAMA_BASE_URL','https://ollama.com').rstrip('/')+'/api/chat',
+                               headers={'Authorization':'Bearer '+os.getenv('OLLAMA_API_KEY','')},
                                json=payload,timeout=(3,timeout))
         response.raise_for_status()
         data=response.json()
